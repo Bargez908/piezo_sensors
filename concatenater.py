@@ -11,6 +11,11 @@ test = "little_pressure"
 test_type = "pressure"  # "sliding" or "pressure"
 finger="little"  # "index", "middle", "ring", "little", "thumb"
 
+macro_folder = "records_final"
+test = "little_level_4"
+test_type = "sliding"  # "sliding" or "pressure"
+finger="little"  # "index", "middle", "ring", "little", "thumb"
+
 n_concatenations = 5
 sensor_values_path = []
 labels_path = []
@@ -25,7 +30,7 @@ for i in range(n_concatenations):
     sensor_values_path.append(os.path.join(script_dir,  "data", macro_folder, test, folder, 'sensor_values_downsampled.npy'))
     labels_path.append(os.path.join(script_dir,         "data", macro_folder, test, folder, 'labels.npy'))   #pressure levels
     labels_path2.append(os.path.join(script_dir,        "data", macro_folder, test, folder, 'labels2.npy')) #pressure/no pressure
-    piezo_data_path.append(os.path.join(script_dir,          "data", macro_folder, test, folder, f'{finger}_downsampled.npy'))
+    piezo_data_path.append(os.path.join(script_dir,     "data", macro_folder, test, folder, f'{finger}_downsampled.npy'))
 #concatenate the data checking the results have the same length
 sensor_values = []
 labels = []
