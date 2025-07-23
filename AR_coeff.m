@@ -12,12 +12,12 @@ finger = 'thumb';
 fileName = [finger '_concatenated.npy'];
 piezo_data_path = fullfile(script_dir, 'data', macro_folder, test, fileName);
 
-data = Neuropixel.readNPY(piezo_data_path);  % ← this line is missing
+data = Neuropixel.readNPY(piezo_data_path); 
 
 % Parameters
 fs = 313; % Sampling frequency
 windowLength = fs; % 1 second window
-overlap = 0.8; % 80% overlap
+overlap = 0.97; % 80% overlap
 stepSize = floor(windowLength * (1 - overlap)); % Step size for windowing
 order = 10; % AR model order
 
@@ -57,6 +57,14 @@ fprintf('Noise Variances size: %s\n', mat2str(size(noiseVariances))); % [channel
 savePath_AR = fullfile(script_dir, 'data', macro_folder, test, 'arCoeffs.npy');
 savePath_Noise = fullfile(script_dir, 'data', macro_folder, test, 'noiseVariances.npy');
 
+
+figure; % Create a new figure
+plot(noiseVariances(1, :)); % Plot the first row
+xlabel('Index'); % Label for x-axis
+ylabel('Variance'); % Label for y-axis
+title('Plot of the First Row of noiseVariance'); % Title of the plot
+grid on;
+
 % Save the arrays
-Neuropixel.writeNPY(arCoeffs, savePath_AR);
-Neuropixel.writeNPY(noiseVariances, savePath_Noise);
+% Neuropixel.writeNPY(arCoeffs, savePath_AR);
+% Neuropixel.writeNPY(noiseVariances, savePath_Noise);
