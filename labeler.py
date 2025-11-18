@@ -5,28 +5,27 @@ import os
 # Creazione di un semplice grafico
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
-finger="index"
-test_n = 1
+finger="thumb"
+test_n = 0
 folder=f"sliding_{finger}_{test_n}"
-test = "sliding"
+test = f"{finger}_level_2\\sliding"
 
 macro_folder = "records_final"
-test = "little_level_4"
 test_type = "sliding"  # "sliding" or "pressure"
-finger="little"  # "index", "middle", "ring", "little", "thumb"
+
+folder1 = f'sliding_{test_n}'
 
 # Define the relative path to the file
-piezo_data_path = os.path.join(script_dir, "data", test, folder, f'{finger}_downsampled.npy')
-trigger_data_path = os.path.join(script_dir, "data", macro_folder, test, folder, 'triggers_downsampled.npy')
+piezo_data_path = os.path.join(script_dir,"data\\records_final", test, folder1, f'{finger}_downsampled.npy')
+trigger_data_path = os.path.join(script_dir,"data\\records_final", test, folder1, 'triggers_downsampled.npy')
 
-sensor_values_path = os.path.join(script_dir, "data", macro_folder, test, folder, 'sensor_values_downsampled.npy')
-labels_path = os.path.join(script_dir, "data", macro_folder, test, folder, 'labels.npy')   #pressure levels
-labels_path2 = os.path.join(script_dir, "data", macro_folder, test, folder, 'labels2.npy') #pressure/no pressure
+sensor_values_path = os.path.join(script_dir,"data\\records_final", test, folder1, 'sensor_values_downsampled.npy')
+labels_path = os.path.join(script_dir,"data\\records_final", test, folder1, 'labels.npy')   #pressure levels
+labels_path2 = os.path.join(script_dir,"data\\records_final", test, folder1, 'labels2.npy') #pressure/no pressure
 # Load the data
 piezo_values = np.load(piezo_data_path)  # Finger sensor data
 sensor_values = np.load(sensor_values_path)  # Force sensor data
 trigger_values = np.load(trigger_data_path)  # Trigger data
-
 
 
 # Ignore the last row (time values)
@@ -121,10 +120,9 @@ plt.grid()
 plt.show()
 
 #save the labels
-labels_path = os.path.join(script_dir,"data", test, folder, 'labels.npy')
 np.save(labels_path, labels)
 #save the cleaned data
-saved_path_sensor = os.path.join(script_dir,"data", test, folder, 'sensor_values_cleaned.npy')
-saved_path_piezo = os.path.join(script_dir, "data", test, folder, f'{finger}_cleaned.npy')
+saved_path_sensor = os.path.join(script_dir,"data\\records_final", test, folder1, 'sensor_values_cleaned.npy')
+saved_path_piezo = os.path.join(script_dir,"data\\records_final", test, folder1, f'{finger}_cleaned.npy')
 np.save(saved_path_sensor, sensor_values_cleaned)
 np.save(saved_path_piezo, piezo_values_cleaned)

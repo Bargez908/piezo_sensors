@@ -13,7 +13,7 @@ finger="little"  # "index", "middle", "ring", "little", "thumb"
 
 test_n = 4
 
-folder=f"{test_type}\{test_type}_{test_n}"
+folder=f"{test_type}\\{test_type}_{test_n}"
 #folder=f"sliding_{finger}_{test_n}"
 
 cut = "false" 
@@ -38,7 +38,6 @@ saved_path_piezo = os.path.join(script_dir,   "data", macro_folder, test, folder
 piezo_values = np.load(piezo_data_path)  # Finger sensor data
 sensor_values = np.load(sensor_values_path)  # Force sensor data
 trigger_values = np.load(trigger_data_path)  # Trigger data
- 
 duration = trigger_values[-1][-1]
 print("Duration = ", duration)
 
