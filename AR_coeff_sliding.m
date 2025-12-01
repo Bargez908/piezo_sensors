@@ -3,10 +3,12 @@ script_dir = pwd;  % Equivalent to os.path.dirname(__file__) if you're running f
 
 % Define subfolders and parameters
 macro_folder = 'records_final';
-test = 'thumb_pressure';
+test = 'thumb_level_3';
 test_n = 4;
-test_type = 'pressure';   % or 'sliding'
-finger = 'thumb';
+test_type = 'sliding';   % or 'sliding'
+finger = 'thumb';  % 'thumb', 'index', 'middle', 'ring', 'little'
+
+max_overlap = true; % Set to true for maximum overlap
 
 % Construct file paths dynamically
 fileName = [finger '_concatenated.npy'];
@@ -16,10 +18,14 @@ data = Neuropixel.readNPY(piezo_data_path);
 
 % Parameters
 fs = 313; % Sampling frequency
-windowLength = fs; % 1 second window
-overlap = 0.97; % 80% overlap
+%windowLength = fs; % 1 second window
+windowLength = 100; 
+overlap = 0.99; % 80% overlap
 stepSize = floor(windowLength * (1 - overlap)); % Step size for windowing
-order = 10; % AR model order
+if max_overlap
+    stepSize = 1; % Maximum overlap
+end
+order = 15; % AR model order
 
 % Number of channels and total timepoints
 [numSamples, numChannels] = size(data);
@@ -66,5 +72,5 @@ title('Plot of the First Row of noiseVariance'); % Title of the plot
 grid on;
 
 % Save the arrays
-% Neuropixel.writeNPY(arCoeffs, savePath_AR);
-% Neuropixel.writeNPY(noiseVariances, savePath_Noise);
+Neuropixel.writeNPY(arCoeffs, savePath_AR);
+Neuropixel.writeNPY(noiseVariances, savePath_Noise);

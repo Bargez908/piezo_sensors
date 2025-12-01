@@ -16,6 +16,39 @@ import joblib
 import time
 from scipy.signal import stft
 from itertools import product
+from sklearn.model_selection import train_test_split
+
+def assign_labels_to_segments(segments, fs, window_length, overlap, labels):
+    """Assign a label to each segment only if all labels in the window are the same. Otherwise, discard the window."""
+    if overlap == 1.0:
+        step = 1
+    else:
+        step = int(window_length * fs * (1 - overlap))  # step size (samples)
+    window_size = int(window_length * fs)
+    segment_labels = []
+    valid_segments = []
+    
+    # Count the total number of segments before filtering
+    total_segments = len(range(0, len(labels) - window_size + 1, step))
+    
+    for start in range(0, len(labels) - window_size + 1, step):
+        label_window = labels[start : start + window_size]
+        # Check if all labels in the window are the same
+        if np.all(label_window == label_window[0]):
+            segment_labels.append(label_window[0])
+            valid_segments.append(segments[start // step])  # Keep the corresponding segment
+        else:
+            # Discard the window if labels are not consistent
+            continue
+    
+    # Print the number of segments before and after filtering
+    print(
+        f"Window Length: {window_length}s, Overlap: {overlap} - "
+        f"Total Segments: {total_segments}, Valid Segments: {len(valid_segments)}"
+    )
+    
+    return np.array(valid_segments), np.array(segment_labels)
+
 
 # if os.name == 'nt':
 #     os.system('cls')
@@ -24,27 +57,28 @@ from itertools import product
 # 1. Data Loading and Setup
 # ---------------------------
 # Define the type of feature extraction
-feature_type = "integral"  # Choose between "wavelet" or "stft" or "integral" or "nothing"
-treshold = True  # Apply a treshold to the piezo values
-filter_type = "ema"  # Choose between "highpass" or "lowpass" or "ema" or "nothing"
+feature_type = "ar"  # Choose between "wavelet" or "stft" or "integral" or "ar" or "nothing"
+treshold = False  # Apply a treshold to the piezo values
+filter_type = "nothing"  # Choose between "highpass" or "lowpass" or "ema" or "nothing"
+freq = 20  # Frequency for the highpass or lowpass filter
 equalize_labels_toggle = False  # Equalize the number of samples for each class
+unify_labels = True  # Remap labels into fewer classes, look at the remapping function to change the mapping
 pop_values_toggle = False  # Pop values of the chosen labels
 labels_to_pop = [1,2,3,4]  # Labels to pop from the dataset
 
-freq = 20  # Frequency for the highpass or lowpass filter
 
 # Get the directory of the current script
 script_dir = os.path.dirname(os.path.abspath(__file__))
 # Define parameters for the data folders
-finger = "index"
+finger = "thumb"
 test_n = 1
-test = "pressure"
+test = "sliding"
 folder1 = f"{test}_{finger}_{test_n}"
 folder2 = f"{test}_{finger}_{test_n+1}"
 classifier = "svm" # Choose between "svm" or "hmm"
 
 # Define segmentation parameters
-window_lengths = [0.2]  # in seconds
+window_lengths = [0.2, 0.4]  # in seconds
 fs = 313
 overlaps = [0.4, 0.6]  # Overlap percentage
 # Define the wavelet families to use (only used if feature_type == "wavelet")
@@ -80,14 +114,118 @@ elif classifier == "hmm":
 
 
 # Load the data
-piezo_values = np.load(piezo_data_path)
-label_points = np.load(labels_data_path)
-piezo_values2 = np.load(piezo_data_path_2)
-label_points2 = np.load(labels_data_path_2)
+if feature_type == "ar":
+    print("Loading AR coefficients for AR feature pipeline...")
 
-print("Set 1 - Labels shape:", label_points.shape)
-print("Set 2 - Labels shape:", label_points2.shape)
-print("Set 1 - Piezo values shape:", piezo_values.shape)
+    # Load full AR dataset
+    if test == "pressure":
+        AR_coeffs_full  = np.load(os.path.join(script_dir, "data", "records_final", f'{finger}_{test}', "arCoeffs.npy"))
+        noiseVar_full   = np.load(os.path.join(script_dir, "data", "records_final", f'{finger}_{test}', "noiseVariances.npy"))
+        labels_full     = np.load(os.path.join(script_dir, "data", "records_final", f'{finger}_{test}', "labels_concatenated.npy"))
+    elif test == "sliding":
+        AR_coeffs_full  = np.load(os.path.join(script_dir, "data", "records_final", f'{finger}_level_3', "arCoeffs.npy"))
+        noiseVar_full   = np.load(os.path.join(script_dir, "data", "records_final", f'{finger}_level_3', "noiseVariances.npy"))
+        labels_full     = np.load(os.path.join(script_dir, "data", "records_final", f'{finger}_level_3', "labels_concatenated.npy"))
+    else:
+        raise ValueError("Invalid test type. Choose 'pressure' or 'sliding'.")
+
+    # -------------------------------------------------
+    # -------------
+    # 1. BUILD FLATTENED AR FEATURESET
+    # --------------------------------------------------------------
+    AR_trimmed_full = AR_coeffs_full[:, 1:, :]        # remove AR(0)
+    noise_exp_full  = noiseVar_full[:, None, :]       # [8 x 1 x N]
+    AR_full = np.concatenate([AR_trimmed_full, noise_exp_full], axis=1)
+    N_windows = AR_full.shape[2]
+    features_full = AR_full.transpose(2, 0, 1).reshape(N_windows, -1)
+
+    print("AR full features:", features_full.shape)
+    print("Raw labels_full shape:", labels_full.shape)
+
+    #plot the distribution of the labels
+    unique, counts = np.unique(labels_full, return_counts=True)
+    print("Label distribution:", dict(zip(unique, counts)))
+
+    # --------------------------------------------------------------
+    # 2. RECREATE MATLAB WINDOWS FOR LABELING
+    # --------------------------------------------------------------
+    windowLength = fs                       # 313 samples
+    windowLength = 100
+    overlap = 0.99
+    stepSize = int(windowLength * (1 - overlap))   # ≈ 9
+    stepSize = 1   # maximum overlap
+
+    segments_ar = []
+    start = 0
+    while start + windowLength <= len(labels_full):
+        segments_ar.append(np.arange(start, start + windowLength))
+        start += stepSize
+
+    segments_ar = np.array(segments_ar)   # shape = (N_windows, windowLength)
+
+    if segments_ar.shape[0] != N_windows:
+        raise ValueError(
+            f"AR windows mismatch: {N_windows} feature windows vs {segments_ar.shape[0]} label windows"
+        )
+
+    # --------------------------------------------------------------
+    # 3. ASSIGN LABELS PER WINDOW
+    # --------------------------------------------------------------
+    # --------------------------------------------------------------
+    # 3. Compute labels for ALL windows (following assign_labels logic)
+    # --------------------------------------------------------------
+    all_labels = []
+
+    for seg in segments_ar:
+        seg_lab = labels_full[seg]
+
+        # find unique labels and counts in this window
+        values, counts = np.unique(seg_lab, return_counts=True)
+
+        # valid only if one class dominates the whole window
+        if len(values) == 1:
+            all_labels.append(values[0])
+        else:
+            all_labels.append(-1)   # mark invalid window
+
+    all_labels = np.array(all_labels)
+    print("All AR windows:", len(all_labels))
+
+    # --------------------------------------------------------------
+    # 4. REMOVE INVALID WINDOWS FROM FEATURES
+    # --------------------------------------------------------------
+    valid_indices = np.where(all_labels != -1)[0]
+    print("Valid AR windows:", len(valid_indices))
+
+    # filter AR features and labels
+    features_full = features_full[valid_indices]
+    labels_full   = all_labels[valid_indices]
+
+    print("Filtered AR features:", features_full.shape)
+    print("Filtered AR labels:", labels_full.shape)
+
+    # --------------------------------------------------------------
+    # 4. TRAIN / TEST SPLIT (NO SHUFFLE)
+    # --------------------------------------------------------------
+    ratio = 0.7
+    N_train = int(len(features_full) * ratio)
+
+    piezo_values  = features_full[:N_train]
+    label_points  = labels_full[:N_train]
+
+    piezo_values2 = features_full[N_train:]
+    label_points2 = labels_full[N_train:]
+
+    print("AR Train:", piezo_values.shape, label_points.shape)
+    print("AR Test: ", piezo_values2.shape, label_points2.shape)
+else:
+    piezo_values = np.load(piezo_data_path)
+    label_points = np.load(labels_data_path)
+    piezo_values2 = np.load(piezo_data_path_2)
+    label_points2 = np.load(labels_data_path_2)
+    print("Set 1 - Labels shape:", label_points.shape)
+    print("Set 2 - Labels shape:", label_points2.shape)
+    print("Set 1 - Piezo values shape:", piezo_values.shape)
 
 # Optional: Plot class labels for both sets
 plt.figure(figsize=(10, 4))
@@ -100,28 +238,35 @@ plt.legend()
 plt.grid()
 plt.show()
 
-def pop_values(label_points, piezo_values, label_to_pop):
-    """Pop values from the given label."""  
-    label_indices_to_pop = np.where(label_points == label_to_pop)[0]
-    
-    # Reverse the indices to avoid shifting when deleting
-    for index in reversed(label_indices_to_pop):
-        label_points = np.delete(label_points, index)
-        piezo_values = np.delete(piezo_values, index, axis=0)
-    
-    return label_points, piezo_values
+def pop_values(label_points, piezo_values, labels_to_pop):
+    mask = ~np.isin(label_points, labels_to_pop)
+    return label_points[mask], piezo_values[mask]
+
 
 
 if pop_values_toggle:
-    for i in labels_to_pop:
-        label_points, piezo_values = pop_values(label_points, piezo_values, i)
-        label_points2, piezo_values2 = pop_values(label_points2, piezo_values2, i)
+    label_points,  piezo_values  = pop_values(label_points,  piezo_values,  labels_to_pop)
+    label_points2, piezo_values2 = pop_values(label_points2, piezo_values2, labels_to_pop)
 
 
-# Map labels to binary classes
-if test != "pressure":
-    label_points = np.where(np.isin(label_points, [5,6]), 1, 0)
-    label_points2 = np.where(np.isin(label_points2, [5,6]), 1, 0)
+# Remap labels into 3 classes:
+# 0 → 0
+# 1,2,3,4 → 1
+# 5,6 → 2
+
+def remap_labels(y):
+    y_new = np.copy(y)
+
+    y_new[np.isin(y, [0])] = 0
+    y_new[np.isin(y, [5,6])] = 1
+    #y_new[np.isin(y, [5,6])] = 2
+
+    return y_new
+
+if unify_labels:
+    label_points  = remap_labels(label_points)
+    label_points2 = remap_labels(label_points2)
+
 
 
 plt.figure(figsize=(10, 4))
@@ -139,32 +284,31 @@ plt.close('all')  # Close all previous figures
 # 1.5 Label Equalization
 # ---------------------------------
 
-
 def equalize_labels(label_points, piezo_values):
-    # Step 1: Find the label with the fewest values
-    unique_labels, label_counts = np.unique(label_points, return_counts=True)
-    min_count = min(label_counts)
-    
-    # Step 2: For each label, pop values until the number of occurrences matches the minimum count
-    labels_to_remove = {label: count - min_count for label, count in zip(unique_labels, label_counts) if count > min_count}
-    
-    # Step 3: Iterate through the labels and remove from both label_points and piezo_values
-    label_indices_to_remove = []
-    for label, count_to_remove in labels_to_remove.items():
-        indices = np.where(label_points == label)[0]
-        for i in range(count_to_remove):
-            label_indices_to_remove.append(indices[-(i+1)])
+    """
+    Equalize the number of samples for each class by undersampling (NO SHUFFLE).
+    """
+    unique_labels, counts = np.unique(label_points, return_counts=True)
+    min_count = counts.min()
 
-    # Step 4: Sort indices in reverse order to avoid shifting when popping
-    label_indices_to_remove.sort(reverse=True)
+    final_indices = []
 
-    # Step 5: Pop values from both label_points and piezo_values
+    for label in unique_labels:
+        idx = np.where(label_points == label)[0]
 
-    for index in label_indices_to_remove:
-        label_points = np.delete(label_points, index)
-        piezo_values = np.delete(piezo_values, index, axis=0)
-    
-    return label_points, piezo_values
+        # undersample if necessary, but keep order
+        if len(idx) > min_count:
+            chosen = idx[:min_count]   # NO RANDOM, KEEP FIRST min_count
+        else:
+            chosen = idx
+
+        final_indices.append(chosen)
+
+    # keep chronological order
+    final_indices = np.sort(np.concatenate(final_indices))
+
+    return label_points[final_indices], piezo_values[final_indices]
+
 
 if equalize_labels_toggle:
     print("len label_points", len(label_points))
@@ -237,7 +381,7 @@ def find_threshold(signal):
 #i want to print the number of labels appearing
 print("number of labels appearing", np.unique(label_points, return_counts=True))
 # Create segments for both datasets
-if feature_type not in ["nothing", "integral"]:
+if feature_type not in ["nothing", "integral", "ar"]:
     segments = {
         wl: {
             ov: apply_filter(segment_signal(piezo_values, fs, wl, ov), fs, filter_type, freq) 
@@ -261,44 +405,13 @@ elif filter_type != "nothing":
 
     threshold2 = find_threshold(piezo_values2[:2000])
 
-def assign_labels_to_segments(segments, fs, window_length, overlap, labels):
-    """Assign a label to each segment only if all labels in the window are the same. Otherwise, discard the window."""
-    if overlap == 1.0:
-        step = 1
-    else:
-        step = int(window_length * fs * (1 - overlap))  # step size (samples)
-    window_size = int(window_length * fs)
-    segment_labels = []
-    valid_segments = []
-    
-    # Count the total number of segments before filtering
-    total_segments = len(range(0, len(labels) - window_size + 1, step))
-    
-    for start in range(0, len(labels) - window_size + 1, step):
-        label_window = labels[start : start + window_size]
-        # Check if all labels in the window are the same
-        if np.all(label_window == label_window[0]):
-            segment_labels.append(label_window[0])
-            valid_segments.append(segments[start // step])  # Keep the corresponding segment
-        else:
-            # Discard the window if labels are not consistent
-            continue
-    
-    # Print the number of segments before and after filtering
-    print(
-        f"Window Length: {window_length}s, Overlap: {overlap} - "
-        f"Total Segments: {total_segments}, Valid Segments: {len(valid_segments)}"
-    )
-    
-    return np.array(valid_segments), np.array(segment_labels)
-
 # Assign labels to segments for both datasets
 labeled_segments = {}
 labeled_segments2 = {}
 valid_segments = {}
 valid_segments2 = {}
 
-if feature_type not in ["nothing", "integral"]:
+if feature_type not in ["nothing", "integral", "ar"]:
     for wl in window_lengths:
         labeled_segments[wl] = {}
         labeled_segments2[wl] = {}
@@ -348,6 +461,7 @@ if feature_type == "wavelet":
         wl: {ov: {w: extract_wavelet_features(valid_segments2[wl][ov], w) for w in wavelets} for ov in overlaps}
         for wl in window_lengths
     }
+
 elif feature_type == "stft":
     features = {
         wl: {ov: extract_stft_features(valid_segments[wl][ov], fs) for ov in overlaps}
@@ -357,6 +471,7 @@ elif feature_type == "stft":
         wl: {ov: extract_stft_features(valid_segments2[wl][ov], fs) for ov in overlaps}
         for wl in window_lengths
     }
+
 elif feature_type == "integral":
     # Compute the integral of piezo_values
     if treshold:
@@ -368,7 +483,6 @@ elif feature_type == "integral":
         plt.legend()
         plt.grid()
         plt.show()
-
     #sum only where the signal is out of threshold
         features = np.cumsum(np.where((piezo_values < threshold[0]) | (piezo_values > threshold[1]), piezo_values, 0), axis=0) / fs
         features2 = np.cumsum(np.where((piezo_values2 < threshold2[0]) | (piezo_values2 > threshold2[1]), piezo_values2, 0), axis=0) / fs
@@ -388,8 +502,27 @@ elif feature_type == "nothing":
     # Directly use the full signal without feature extraction
     features = piezo_values
     features2 = piezo_values2
+
+elif feature_type == "ar":
+    # ------------------------------------------------------------
+    # AR features & labels already aligned and split above
+    # ------------------------------------------------------------
+    features  = piezo_values      # [N_train × 88]
+    features2 = piezo_values2     # [N_test  × 88]
+
+    labels_train = label_points   # [N_train]
+    labels_test  = label_points2  # [N_test]
+
+    # Build labeled matrices
+    labeled_features  = np.hstack((features,  labels_train[:, None]))
+    labeled_features2 = np.hstack((features2, labels_test[:, None]))
+
+    print("AR labeled_features :", labeled_features.shape)
+    print("AR labeled_features2:", labeled_features2.shape)
+
+
 else:
-    raise ValueError("Invalid type. Choose 'wavelet', 'stft', or 'nothing'.")
+    raise ValueError("Invalid type. Choose 'wavelet', 'stft', 'integral', 'nothing', or 'ar'.")
 
 # Print the shapes for verification
 if feature_type == "nothing":
@@ -410,7 +543,7 @@ else:
 # ---------------------------------
 labeled_features = {}
 labeled_features2 = {}
-if feature_type in ["nothing", "integral"]:
+if feature_type in ["nothing", "integral", "ar"]:
     # Directly pair raw signals with labels
     if len(label_points) != features.shape[0]:
         raise ValueError(
@@ -482,6 +615,8 @@ def train_and_evaluate_svm(wl, w, ov, C, gamma, kernel, X_train, y_train, X_test
         param_set = f"Raw Signal, Kernel: {kernel}, Gamma: {gamma}, C: {C}"
     elif feature_type == "integral":
         param_set = f"Integral Signal, Kernel: {kernel}, Gamma: {gamma}, C: {C}"
+    elif feature_type == "ar":
+        param_set = f"AR Features, Kernel: {kernel}, Gamma: {gamma}, C: {C}"
     color = get_color_code(param_set)
     
     print(f"{color}[{time.strftime('%H:%M:%S')}] Started training with: {param_set}\033[0m")
@@ -653,9 +788,9 @@ def train_and_evaluate_hmm(wl, w, ov, X_train, y_train, X_test, y_test, unsuperv
     
 # Prepare all parameter combinations (each tuple contains all required data)
 param_combinations = []
-
 if classifier == "svm":
-    if feature_type in ["nothing", "integral"]:
+    if feature_type in ["nothing", "integral", "ar"]:
+        # AR behaves like nothing/integral → simple train/test split already done
         for C in C_values:
             for gamma in gamma_values:
                 for kernel in kernels:
@@ -664,7 +799,9 @@ if classifier == "svm":
                          labeled_features[:, :-1], labeled_features[:, -1],
                          labeled_features2[:, :-1], labeled_features2[:, -1])
                     )
+
     else:
+        # WAVELET or STFT
         for wl in window_lengths:
             for ov in overlaps:
                 if feature_type == "wavelet":
@@ -674,17 +811,18 @@ if classifier == "svm":
                                 for kernel in kernels:
                                     param_combinations.append(
                                         (wl, w, ov, C, gamma, kernel,
-                                         labeled_features[wl][ov][w][:, :-1], labeled_features[wl][ov][w][:, -1],
-                                         labeled_features2[wl][ov][w][:, :-1], labeled_features2[wl][ov][w][:, -1])
+                                         labeled_features[wl][ov][w][:, :-1],   labeled_features[wl][ov][w][:, -1],
+                                         labeled_features2[wl][ov][w][:, :-1],  labeled_features2[wl][ov][w][:, -1])
                                     )
+
                 elif feature_type == "stft":
                     for C in C_values:
                         for gamma in gamma_values:
                             for kernel in kernels:
                                 param_combinations.append(
                                     (wl, None, ov, C, gamma, kernel,
-                                     labeled_features[wl][ov][:, :-1], labeled_features[wl][ov][:, -1],
-                                     labeled_features2[wl][ov][:, :-1], labeled_features2[wl][ov][:, -1])
+                                     labeled_features[wl][ov][:, :-1],   labeled_features[wl][ov][:, -1],
+                                     labeled_features2[wl][ov][:, :-1],  labeled_features2[wl][ov][:, -1])
                                 )
 
 if classifier == "hmm":
@@ -771,6 +909,9 @@ for i, result in enumerate(sorted_results[:30], start=1):
         elif feature_type == "integral":
             print(f"Rank {i}: Integral Signal, Kernel: {result['kernel']}, Gamma: {result['gamma']}, C: {result['C']}, "
                   f"accuracy: {result['accuracy']:.4f}")
+        elif feature_type == "ar":
+            print(f"Rank {i}: AR Features, Kernel: {result['kernel']}, Gamma: {result['gamma']}, C: {result['C']}, "
+                  f"accuracy: {result['accuracy']:.4f}")
     elif classifier == "hmm":
         print(f"Rank {i}: Window: {result['window_length']}s, Overlap: {result['overlap']}, "
               f"Accuracy: {result.get('accuracy', 'N/A')}")
@@ -783,7 +924,7 @@ else:
     best_cm = None  # No confusion matrix for unsupervised HMM
 
 # Extract unique labels
-if feature_type in ["nothing", "integral"]:
+if feature_type in ["nothing", "integral", "ar"]:
     unique_labels = np.unique(labeled_features2[:, -1])
 else:
     if feature_type == "wavelet":
@@ -821,6 +962,13 @@ if best_cm is not None:
                 f"Gamma: {best_result_test_on_set2['gamma']}, C: {best_result_test_on_set2['C']}, "
                 f"Accuracy: {best_result_test_on_set2['accuracy']:.2%})"
             )
+        elif feature_type == "ar":
+            plt.title(
+                f"Confusion Matrix (Best AR Features, Kernel: {best_result_test_on_set2['kernel']}, "
+                f"Gamma: {best_result_test_on_set2['gamma']}, C: {best_result_test_on_set2['C']}, "
+                f"Accuracy: {best_result_test_on_set2['accuracy']:.2%})"
+            )
+
         else:
             plt.title(
                 f"Confusion Matrix (Best: Window: {best_result_test_on_set2['window_length']}s, "
@@ -845,7 +993,7 @@ if best_cm is not None:
 
     plt.show()
 # Extract the correct feature matrix for prediction
-if feature_type in ["nothing", "integral"]:
+if feature_type in ["nothing", "integral", "ar"]:
     X_test = labeled_features2[:, :-1]  # Features are all columns except the last
     y_test = labeled_features2[:, -1]   # Labels are the last column
 else:

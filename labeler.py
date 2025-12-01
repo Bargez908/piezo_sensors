@@ -6,9 +6,9 @@ import os
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
 finger="thumb"
-test_n = 0
+test_n = 4
 folder=f"sliding_{finger}_{test_n}"
-test = f"{finger}_level_2\\sliding"
+test = f"{finger}_level_3\\sliding"
 
 macro_folder = "records_final"
 test_type = "sliding"  # "sliding" or "pressure"
@@ -21,7 +21,7 @@ trigger_data_path = os.path.join(script_dir,"data\\records_final", test, folder1
 
 sensor_values_path = os.path.join(script_dir,"data\\records_final", test, folder1, 'sensor_values_downsampled.npy')
 labels_path = os.path.join(script_dir,"data\\records_final", test, folder1, 'labels.npy')   #pressure levels
-labels_path2 = os.path.join(script_dir,"data\\records_final", test, folder1, 'labels2.npy') #pressure/no pressure
+#labels_path2 = os.path.join(script_dir,"data\\records_final", test, folder1, 'labels2.npy') #pressure/no pressure
 # Load the data
 piezo_values = np.load(piezo_data_path)  # Finger sensor data
 sensor_values = np.load(sensor_values_path)  # Force sensor data
