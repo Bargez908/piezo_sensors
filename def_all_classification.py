@@ -61,8 +61,8 @@ feature_type = "ar"  # Choose between "wavelet" or "stft" or "integral" or "ar" 
 treshold = False  # Apply a treshold to the piezo values
 filter_type = "nothing"  # Choose between "highpass" or "lowpass" or "ema" or "nothing"
 freq = 20  # Frequency for the highpass or lowpass filter
-equalize_labels_toggle = False  # Equalize the number of samples for each class
-unify_labels = True  # Remap labels into fewer classes, look at the remapping function to change the mapping
+equalize_labels_toggle = True  # Equalize the number of samples for each class
+remap_labels_toggle = False  # Remap labels into fewer classes, look at the remapping function to change the mapping
 pop_values_toggle = False  # Pop values of the chosen labels
 labels_to_pop = [1,2,3,4]  # Labels to pop from the dataset
 
@@ -263,7 +263,7 @@ def remap_labels(y):
 
     return y_new
 
-if unify_labels:
+if remap_labels_toggle:
     label_points  = remap_labels(label_points)
     label_points2 = remap_labels(label_points2)
 
