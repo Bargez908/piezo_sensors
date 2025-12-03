@@ -1,0 +1,10 @@
+1) Classification
+	-Downsampler (piezo{finger}, received_trigger, sensor data) -> (sensor_value_downsampled, triggers_downsampled, {finger}_downsampled)
+	1.1) Pressure
+		-Labeler pressure (sensor_values_downsampled) -> (labels, labels2) [labels ha ogni livello, labels2 solo pressure/non pressure]
+		1.1.1) Robertino AR
+			-Concatenater pressure (sensor_value_downsampled, labels, labels2, {finger}_downsampled) -> (sensor_values_concatenated, labels_concatenated, labels2_concatenated, {finger}_concatenated)
+	1.2) Sliding
+		-Labeler (sensor_value_downsampled,  triggers_downsampled, {finger}_downsampled) -> (labels, sensor_values_cleaned, {finger}_cleaned) [labels e i cleaned hanno primi 2/6 e ultimo 1/6 rimosso]
+		1.2.1) Robertino AR
+			-Concatenater sliding (sensor_values_cleaned, labels, {finger}_cleaned) -> (sensor_values_concatenated, labels_concatenated, {finger}_concatenated)
