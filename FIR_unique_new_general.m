@@ -16,7 +16,7 @@ test      = 'thumb_pressure';     % es: 'thumb_pressure', 'little_level_4'
 finger    = 'thumb';              % es: 'index','middle','ring','little','thumb'
 
 % === CLASSIFICATION o REGRESSION ===
-type_fir = "classification";          % "classification" o "regression"
+type_fir = "regression";          % "classification" o "regression"
 
 % === FILE concatenati prodotti dal tuo concatenater ===
 labels_file = 'labels_concatenated.npy';
@@ -42,8 +42,8 @@ if strcmp(type_fir, "regression")
 end
 
 %% PARAMETRI FINESTRE
-windowLength = 313;    % numero di campioni
-overlap      = 0.97;   % 99% → step = 1 campione
+windowLength = 200;    % numero di campioni
+overlap      = 0.97;  
 stepSize     = max(1, floor(windowLength * (1 - overlap)));
 
 %% PARAMETRI DEL FIR
@@ -66,6 +66,46 @@ fprintf('Samples: %d, Channels: %d\n', numSamples, numChannels);
 if length(labels) ~= numSamples
     error('labels_concatenated e %s_concatenated hanno lunghezze diverse!', finger);
 end
+
+%% ================================================================
+% TRAIN/TEST SPLIT (sequenziale, NO shuffle)
+% ================================================================
+
+train_ratio = 0.8;   % <-- QUI decidi quanto usare per training (es. 0.8 = 80%)
+
+train_end = floor(numSamples * train_ratio);
+
+fprintf('\nSuddivisione dati: %.0f%% train, %.0f%% test\n', ...
+        train_ratio*100, (1-train_ratio)*100);
+
+% TRAIN
+X_train      = X(1:train_end, :);
+labels_train = labels(1:train_end);
+
+if strcmp(type_fir, "regression")
+    Y_train = Y(1:train_end);
+end
+
+% TEST (lo userai dopo, NON nelle FIR)
+X_test      = X(train_end+1:end, :);
+labels_test = labels(train_end+1:end);
+
+if strcmp(type_fir, "regression")
+    Y_test = Y(train_end+1:end);
+end
+
+fprintf("TRAIN samples: %d\n", size(X_train,1));
+fprintf("TEST  samples: %d\n", size(X_test,1));
+
+% DA QUI IN POI, USA SOLO IL TRAIN SET!!
+X     = X_train;
+labels = labels_train;
+if strcmp(type_fir, "regression")
+    Y = Y_train;
+end
+
+[numSamples, numChannels] = size(X);
+
 
 %% --- LABEL UNICHE ---
 
@@ -176,12 +216,65 @@ for lIdx = 1:numLabels
             % Salva nella struttura finale
             firModels{lIdx, ch}{wIdx} = model;
         end
-        fprintf('  Finestra %d/%d completata.\n', wIdx, nWins);
+        %fprintf('  Finestra %d/%d completata.\n', wIdx, nWins);
     end
     fprintf('Training per label %d completato.\n', lbl_val);
 end
 
 fprintf('\nTraining FIR completato.\n');
+
+%% ================================================================
+% CALCOLO MEDIA E VARIANZA DEI COEFFICIENTI FIR PER LABEL E CANALE
+% ================================================================
+
+fir_mean = cell(numLabels, numChannels);
+fir_var  = cell(numLabels, numChannels);
+
+fprintf('\nCalcolo media e varianza dei coefficienti FIR...\n');
+
+for lIdx = 1:numLabels
+    lbl_val = unique_labels(lIdx);
+
+    for ch = 1:numChannels
+
+        models_cell = firModels{lIdx, ch};
+
+        if isempty(models_cell)
+            fprintf('[Label %d, Channel %d] Nessun modello FIR.\n', lbl_val, ch);
+            continue;
+        end
+        
+        % Estrai tutti i coefficienti FIR B
+        coeff_matrix = [];
+
+        for wIdx = 1:numel(models_cell)
+            model = models_cell{wIdx};
+            B = model.B;                     % vettore FIR [1 × (fir_order+1)]
+            coeff_matrix = [coeff_matrix; B];  %#ok<AGROW>
+        end
+
+        % MEDIA e VARIANZA
+        fir_mean{lIdx, ch} = mean(coeff_matrix, 1);      % [1 × nb+1]
+        fir_var{lIdx, ch}  = var(coeff_matrix, 0, 1);     % [1 × nb+1]
+
+        % -----------------------------------------
+        % STAMPA VALORI REALI (media e varianza)
+        % -----------------------------------------
+        fprintf("\n==============================\n");
+        fprintf("LABEL %d  |  CANALE %d\n", lbl_val, ch);
+        fprintf("==============================\n");
+
+        fprintf("Media coeff FIR:\n");
+        disp(fir_mean{lIdx, ch});
+
+        fprintf("Varianza coeff FIR:\n");
+        disp(fir_var{lIdx, ch});
+        fprintf("--------------------------------\n");
+    end
+end
+
+fprintf('\nMedia e varianza FIR calcolate e stampate.\n');
+
 
 %% ================================================================
 % SALVATAGGIO
@@ -191,7 +284,39 @@ savePath = fullfile(base_path, ...
     sprintf('FIR_models_%s_win%d_ov%.2f_firord%d.mat', ...
     finger, windowLength, overlap, fir_order));
 
-%save(savePath, 'firModels', 'unique_labels', ...
-%    'windowLength', 'overlap', 'fir_order', 'na', 'nk');
+save(savePath, 'firModels', 'unique_labels', ...
+    'windowLength', 'overlap', 'fir_order', 'na', 'nk', '-v7.3');
+
+fprintf('\nDimensioni modelli FIR nella prima finestra:\n');
+
+nb_plus1 = length(fir_mean{1,1});  % numero coeff FIR per ogni finestra
+
+FIR_mean_matrix = zeros(numLabels, numChannels, nb_plus1);
+FIR_var_matrix  = zeros(numLabels, numChannels, nb_plus1);
+
+for lIdx = 1:numLabels
+    for ch = 1:numChannels
+        FIR_mean_matrix(lIdx, ch, :) = fir_mean{lIdx, ch};
+        FIR_var_matrix(lIdx,  ch, :) = fir_var{lIdx, ch};
+    end
+end
+
+Neuropixel.writeNPY(FIR_mean_matrix, fullfile(base_path, 'FIR_mean_matrix.npy'));
+Neuropixel.writeNPY(FIR_var_matrix,  fullfile(base_path, 'FIR_var_matrix.npy'));
+fprintf('FIR mean e varianza salvati come matrici NPY.\n');
+
+
+for lIdx = 1:numLabels
+    for ch = 1:numChannels
+        if ~isempty(firModels{lIdx,ch})
+            m = firModels{lIdx,ch}{1};
+            fprintf("Label %d, Channel %d, FIR size(B) = %s\n", ...
+                unique_labels(lIdx), ch, mat2str(size(m.B)));
+        end
+    end
+end
+
 
 fprintf('\nModelli FIR salvati in:\n  %s\n', savePath);
+
+
