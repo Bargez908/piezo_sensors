@@ -13,9 +13,10 @@ macro_folder = 'records_final';
 
 test      = 'thumb_pressure';
 finger    = 'thumb';
+test_n   = 4;
 
-fileName = [finger '_concatenated.npy'];
-piezo_path = fullfile(script_dir, 'data', macro_folder, test, fileName);
+fileName = [finger '_downsampled.npy'];
+piezo_path = fullfile(script_dir, 'data', macro_folder, test, 'pressure', ['pressure_' num2str(test_n)], fileName);
 
 fprintf("Caricamento dati: %s\n", piezo_path);
 data = Neuropixel.readNPY(piezo_path);   % [N × numChannels]
@@ -25,10 +26,10 @@ data = Neuropixel.readNPY(piezo_path);   % [N × numChannels]
 %% === PARAMETRI MULTI-RUN ===
 
 orders         = [5, 10, 15];           % ordini AR da testare
-windowLengths  = [80, 135, 313];        % campioni per finestra
-overlaps       = [0.50, 0.80, 0.97];    % percentuali (0.50 = 50%)
+windowLengths  = [25, 100, 400];        % campioni per finestra
+overlaps       = [0.50, 1];    % percentuali (0.50 = 50%)
 
-save_dir = fullfile(script_dir, 'data', macro_folder, test, 'ar_coeff');
+save_dir = fullfile(script_dir, 'data', macro_folder, test, 'pressure', ['pressure_' num2str(test_n)], 'ar_coeff');
 
 %% === LOOP SU TUTTE LE COMBINAZIONI ===
 
@@ -72,6 +73,10 @@ for overlap = overlaps
 
     % overlap in percentuale
     overlap_percent = round(overlap * 100);
+
+    if ~exist(save_dir, 'dir')
+        mkdir(save_dir);
+    end
 
     base_name = sprintf('%d_%d_%d', order, windowLength, overlap_percent);
 
