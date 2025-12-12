@@ -77,9 +77,9 @@ folder1 = f"{test}_{finger}_{test_n}"
 folder2 = f"{test}_{finger}_{test_n+1}"
 classifier = "svm" # Choose between "svm" or "hmm"
 
-AR_orders = [5, 10, 15]
-AR_window_lengths = [25, 100, 400]
-AR_overlaps = [50, 100]   # percentuali, NON 0.5
+AR_orders = [5, 10]
+AR_window_lengths = [25, 100]
+AR_overlaps = [50]   # percentuali, NON 0.5
 
 # Define segmentation parameters for non ar features
 window_lengths = [0.2, 0.4]  # in seconds
@@ -90,7 +90,7 @@ overlaps = [0.4, 0.6]  # Overlap percentage
 wavelets = ['db2', 'db3', 'db4', 'sym2', 'sym3', 'sym4', 'coif2', 'coif3', 'coif4']
 
 # Define SVM hyperparameters
-C_values = [2, 1, 1/2]
+C_values = [2]
 gamma_values = ['scale']
 kernels = ['rbf']
 # initial_transition_matrix = np.array([[0.9, 0.1, 0, 0], 
@@ -206,44 +206,101 @@ def remap_labels(y):
 
     return y_new
 
-def equalize_labels_temporal(labels, features):
+def equalize_labels_temporal(dataset_list):
     """
-    Equalizza le classi con undersampling temporale uniforme.
-    labels:   (N,)    array di etichette
-    features: (N,F)   array di feature
-    Ritorna: labels_eq, features_eq
+    Equalizza TUTTI i dataset usando un UNICO minimo globale tra tutte le classi.
+    Ogni label in ogni dataset viene ridotta allo stesso valore minimo.
+    Sottocampionamento temporale uniforme.
     """
-    unique_labels, counts = np.unique(labels, return_counts=True)
-    min_count = counts.min()
 
-    keep_indices = []
+    # ============================
+    # 1) Trova tutte le classi
+    # ============================
+    all_labels = np.unique(np.concatenate([ds["labels"] for ds in dataset_list]))
 
-    for lbl in unique_labels:
-        idx = np.where(labels == lbl)[0]     # indici di questa classe
-        n = len(idx)
+    print("\n=== Global Equalization Summary (UNIQUE GLOBAL MIN) ===")
+    print("Classi trovate:", all_labels.tolist())
 
-        # determinare il fattore di sottocampionamento
-        # vogliamo ottenere esattamente min_count valori
-        # formula: prendi circa ogni k-esimo campione
-        k = n / min_count                    # es. 100 / 50 = 2 → tieni 1 ogni 2
-        selected = []
+    # ============================
+    # 2) Conteggi PRIMA
+    # ============================
+    print("\n>> Conteggi PRIMA dell’equalizzazione:")
+    label_counts = []
 
-        acc = 0.0
-        for i in idx:
-            if acc >= 1.0:
-                selected.append(i)
-                acc -= 1.0
-            acc += 1.0 / k
+    for i, ds in enumerate(dataset_list):
+        y = ds["labels"]
+        counts = [np.sum(y == lbl) for lbl in all_labels]
+        label_counts.append(counts)
+        print(f"  Dataset {i}: " +
+              " | ".join([f"lbl {lbl}: {c}" for lbl, c in zip(all_labels, counts)]))
 
-        # Se per arrotondamenti abbiamo meno elementi del dovuto, pad finale
-        if len(selected) < min_count:
-            selected.extend(idx[len(selected):min_count])
+    # ============================
+    # 3) Trova il MINIMO UNICO TRA TUTTI
+    # ============================
+    global_min = min([min(counts) for counts in label_counts])
 
-        keep_indices.extend(selected)
+    print("\n>> MINIMO UNICO GLOBALE:", global_min)
 
-    keep_indices = np.array(sorted(keep_indices))
+    # ============================
+    # 4) Equalizza ogni dataset
+    # ============================
+    processed_list = []
 
-    return labels[keep_indices], features[keep_indices]
+    for ds_idx, ds in enumerate(dataset_list):
+        X = ds["features"]
+        y = ds["labels"]
+
+        keep_indices = []
+
+        for lbl in all_labels:
+            idx = np.where(y == lbl)[0]
+            n = len(idx)
+
+            # sottocampiona a global_min (uniforme nel tempo)
+            if n > global_min:
+
+                k = n / global_min        # esempio: 240/100 = 2.4
+                selected = []
+                acc = 0.0
+
+                for i in idx:
+                    if acc >= 1.0:
+                        selected.append(i)
+                        acc -= 1.0
+                    acc += 1.0 / k
+
+                # correzione finale
+                if len(selected) < global_min:
+                    selected.extend(idx[len(selected):global_min])
+
+                keep_indices.extend(selected)
+
+            else:
+                # n == global_min or n < global_min (raro, ma mantieni tutto)
+                keep_indices.extend(idx[:global_min])
+
+        # ordina indici selezionati
+        keep_indices = np.array(sorted(keep_indices))
+
+        # crea dataset equalizzato
+        processed_list.append({
+            "features": X[keep_indices],
+            "labels": y[keep_indices]
+        })
+
+    # ============================
+    # 5) Conteggi DOPO
+    # ============================
+    print("\n>> Conteggi DOPO equalizzazione (tutti devono essere =", global_min, ")")
+    for i, ds in enumerate(processed_list):
+        y = ds["labels"]
+        counts = [np.sum(y == lbl) for lbl in all_labels]
+        print(f"  Dataset {i}: " +
+              " | ".join([f"{lbl}: {c}" for lbl, c in zip(all_labels, counts)]))
+
+    print("=== Fine equalizzazione globale ===\n")
+
+    return processed_list
 
 
 def build_cv_sets(dataset_list):
@@ -389,15 +446,19 @@ if feature_type == "ar":
                     if remap_labels_toggle:
                         y = remap_labels(y)
 
-                    if equalize_labels_toggle:
-                        y, X = equalize_labels_temporal(y, X)
-
-                    # 3. Skip empty datasets (could happen after POP)
+                    # 3. Skip empty datasets
                     if len(y) == 0:
                         print(f"[WARNING] Dataset empty after pop/remap for order={order}, wl={wl}, ov={ov}")
                         continue
 
                     processed_list.append({"features": X, "labels": y})
+
+                # ---------------------------
+                # 1b) GLOBAL EQUALIZATION (applied once per combination)
+                # ---------------------------
+                if equalize_labels_toggle:
+                    print(f"Equalizing globally for order={order}, wl={wl}, ov={ov}...")
+                    processed_list = equalize_labels_temporal(processed_list)
 
                 # Replace original list with processed list
                 AR_data[order][wl][ov] = processed_list
@@ -434,21 +495,25 @@ if feature_type == "ar":
                                     "X_test": X_test,
                                     "y_test": y_test
                                 })
-    for i, pc in enumerate(param_combinations[:50]):  # solo primi 20
+
+
+    # Print the first 50 combinations
+    for i, pc in enumerate(param_combinations[:50]):
         print(f"#{i}: order={pc['order']}, wl={pc['wl']}, ov={pc['ov']}, "
             f"fold={pc['fold']}, C={pc['C']}, gamma={pc['gamma']}, kernel={pc['kernel']}, "
             f"X_train={pc['X_train'].shape}, X_test={pc['X_test'].shape}")
+    print(f"... Total combinations: {len(param_combinations)}")
 
 
 
-    piezo_values  = features_full[:N_train]
-    label_points  = labels_full[:N_train]
+    # piezo_values  = features_full[:N_train]
+    # label_points  = labels_full[:N_train]
 
-    piezo_values2 = features_full[N_train:]
-    label_points2 = labels_full[N_train:]
+    # piezo_values2 = features_full[N_train:]
+    # label_points2 = labels_full[N_train:]
 
-    print("AR Train:", piezo_values.shape, label_points.shape)
-    print("AR Test: ", piezo_values2.shape, label_points2.shape)
+    # print("AR Train:", piezo_values.shape, label_points.shape)
+    # print("AR Test: ", piezo_values2.shape, label_points2.shape)
 else:
     piezo_values = np.load(piezo_data_path)
     label_points = np.load(labels_data_path)
@@ -461,35 +526,36 @@ else:
 
 
 # Optional: Plot class labels for both sets
-plt.figure(figsize=(10, 4))
-plt.plot(label_points, label="Set 1")
-plt.plot(label_points2, label="Set 2")
-plt.xlabel("Samples")
-plt.ylabel("Class")
-plt.title("Class Labels")
-plt.legend()
-plt.grid()
-plt.show()
+# plt.figure(figsize=(10, 4))
+# plt.plot(label_points, label="Set 1")
+# plt.plot(label_points2, label="Set 2")
+# plt.xlabel("Samples")
+# plt.ylabel("Class")
+# plt.title("Class Labels")
+# plt.legend()
+# plt.grid()
+# plt.show()
 
 
-
+"""
 if pop_values_toggle:
     label_points,  piezo_values  = pop_values(label_points,  piezo_values,  labels_to_pop)
     label_points2, piezo_values2 = pop_values(label_points2, piezo_values2, labels_to_pop)
-
+"""
 
 # Remap labels into 3 classes:
 # 0 → 0
 # 1,2,3,4 → 1
 # 5,6 → 2
 
-
+"""
 if remap_labels_toggle:
     label_points  = remap_labels(label_points)
     label_points2 = remap_labels(label_points2)
+"""
 
 
-
+"""
 plt.figure(figsize=(10, 4))
 plt.plot(label_points, label="Set 1")
 plt.plot(label_points2, label="Set 2")
@@ -500,60 +566,61 @@ plt.legend()
 plt.grid()
 plt.show()
 plt.close('all')  # Close all previous figures
+"""
 
 # ---------------------------------
 # 1.5 Label Equalization
 # ---------------------------------
 
-def equalize_labels(label_points, piezo_values):
-    """
-    Equalize the number of samples for each class by undersampling (NO SHUFFLE).
-    """
-    unique_labels, counts = np.unique(label_points, return_counts=True)
-    min_count = counts.min()
+# def equalize_labels(label_points, piezo_values):
+#     """
+#     Equalize the number of samples for each class by undersampling (NO SHUFFLE).
+#     """
+#     unique_labels, counts = np.unique(label_points, return_counts=True)
+#     min_count = counts.min()
 
-    final_indices = []
+#     final_indices = []
 
-    for label in unique_labels:
-        idx = np.where(label_points == label)[0]
+#     for label in unique_labels:
+#         idx = np.where(label_points == label)[0]
 
-        # undersample if necessary, but keep order
-        if len(idx) > min_count:
-            chosen = idx[:min_count]   # NO RANDOM, KEEP FIRST min_count
-        else:
-            chosen = idx
+#         # undersample if necessary, but keep order
+#         if len(idx) > min_count:
+#             chosen = idx[:min_count]   # NO RANDOM, KEEP FIRST min_count
+#         else:
+#             chosen = idx
 
-        final_indices.append(chosen)
+#         final_indices.append(chosen)
 
-    # keep chronological order
-    final_indices = np.sort(np.concatenate(final_indices))
+#     # keep chronological order
+#     final_indices = np.sort(np.concatenate(final_indices))
 
-    return label_points[final_indices], piezo_values[final_indices]
+#     return label_points[final_indices], piezo_values[final_indices]
 
 
-if equalize_labels_toggle:
-    print("len label_points", len(label_points))
-    label_points, piezo_values = equalize_labels(label_points, piezo_values)
-    label_points2, piezo_values2 = equalize_labels(label_points2, piezo_values2)
-    print("len label_points after equalizing", len(label_points))
+# if equalize_labels_toggle:
+#     print("len label_points", len(label_points))
+#     label_points, piezo_values = equalize_labels(label_points, piezo_values)
+#     label_points2, piezo_values2 = equalize_labels(label_points2, piezo_values2)
+#     print("len label_points after equalizing", len(label_points))
 
-# ---------------------------------
-# 2. Signal Segmentation & Labels
-# ---------------------------------
-def segment_signal(signal, fs, window_length, overlap):
-    """Segment the signal into windows with the given length and overlap."""
-    if overlap == 1.0:
-        step = 1
-    else:
-        step = int(window_length * fs * (1 - overlap))  # step size (samples)
-    window_size = int(window_length * fs)           # window size (samples)
-    segments = []
-    for start in range(0, len(signal) - window_size + 1, step):
-        segments.append(signal[start : start + window_size])
-    return np.array(segments)
+# # ---------------------------------
+# # 2. Signal Segmentation & Labels
+# # ---------------------------------
+# def segment_signal(signal, fs, window_length, overlap):
+#     """Segment the signal into windows with the given length and overlap."""
+#     if overlap == 1.0:
+#         step = 1
+#     else:
+#         step = int(window_length * fs * (1 - overlap))  # step size (samples)
+#     window_size = int(window_length * fs)           # window size (samples)
+#     segments = []
+#     for start in range(0, len(signal) - window_size + 1, step):
+#         segments.append(signal[start : start + window_size])
+#     return np.array(segments)
 
-from scipy.signal import butter, filtfilt
-import numpy as np
+# from scipy.signal import butter, filtfilt
+# import numpy as np
 
 def apply_filter(signal, fs, filter_type, freq=None, alpha=0.1):
     """
@@ -600,54 +667,54 @@ def find_threshold(signal):
 
 
 #i want to print the number of labels appearing
-print("number of labels appearing", np.unique(label_points, return_counts=True))
-# Create segments for both datasets
-if feature_type not in ["nothing", "integral", "ar"]:
-    segments = {
-        wl: {
-            ov: apply_filter(segment_signal(piezo_values, fs, wl, ov), fs, filter_type, freq) 
-            for ov in overlaps
-        } 
-        for wl in window_lengths
-    }
-    segments2 = {
-        wl: {
-            ov: apply_filter(segment_signal(piezo_values2, fs, wl, ov), fs, filter_type, freq) 
-            for ov in overlaps
-        } 
-        for wl in window_lengths
-    }
-elif filter_type != "nothing":
-    # Apply filtering WITHOUT segmentation
-    piezo_values = apply_filter(piezo_values, fs, filter_type, freq)
-    piezo_values2 = apply_filter(piezo_values2, fs, filter_type, freq)
-    #find threshold using the first 1000 samples for each column
-    threshold = find_threshold(piezo_values[:2000])
+# print("number of labels appearing", np.unique(label_points, return_counts=True))
+# # Create segments for both datasets
+# if feature_type not in ["nothing", "integral", "ar"]:
+#     segments = {
+#         wl: {
+#             ov: apply_filter(segment_signal(piezo_values, fs, wl, ov), fs, filter_type, freq) 
+#             for ov in overlaps
+#         } 
+#         for wl in window_lengths
+#     }
+#     segments2 = {
+#         wl: {
+#             ov: apply_filter(segment_signal(piezo_values2, fs, wl, ov), fs, filter_type, freq) 
+#             for ov in overlaps
+#         } 
+#         for wl in window_lengths
+#     }
+# elif filter_type != "nothing":
+#     # Apply filtering WITHOUT segmentation
+#     piezo_values = apply_filter(piezo_values, fs, filter_type, freq)
+#     piezo_values2 = apply_filter(piezo_values2, fs, filter_type, freq)
+#     #find threshold using the first 1000 samples for each column
+#     threshold = find_threshold(piezo_values[:2000])
 
-    threshold2 = find_threshold(piezo_values2[:2000])
+#     threshold2 = find_threshold(piezo_values2[:2000])
 
-# Assign labels to segments for both datasets
-labeled_segments = {}
-labeled_segments2 = {}
-valid_segments = {}
-valid_segments2 = {}
+# # Assign labels to segments for both datasets
+# labeled_segments = {}
+# labeled_segments2 = {}
+# valid_segments = {}
+# valid_segments2 = {}
 
-if feature_type not in ["nothing", "integral", "ar"]:
-    for wl in window_lengths:
-        labeled_segments[wl] = {}
-        labeled_segments2[wl] = {}
-        valid_segments[wl] = {}
-        valid_segments2[wl] = {}
-        for ov in overlaps:
-            print(f"\nProcessing Set 1 - Window Length: {wl}s, Overlap: {ov}")
-            valid_segs, seg_labels = assign_labels_to_segments(segments[wl][ov], fs, wl, ov, label_points)
-            valid_segments[wl][ov] = valid_segs
-            labeled_segments[wl][ov] = seg_labels
+# if feature_type not in ["nothing", "integral", "ar"]:
+#     for wl in window_lengths:
+#         labeled_segments[wl] = {}
+#         labeled_segments2[wl] = {}
+#         valid_segments[wl] = {}
+#         valid_segments2[wl] = {}
+#         for ov in overlaps:
+#             print(f"\nProcessing Set 1 - Window Length: {wl}s, Overlap: {ov}")
+#             valid_segs, seg_labels = assign_labels_to_segments(segments[wl][ov], fs, wl, ov, label_points)
+#             valid_segments[wl][ov] = valid_segs
+#             labeled_segments[wl][ov] = seg_labels
             
-            print(f"\nProcessing Set 2 - Window Length: {wl}s, Overlap: {ov}")
-            valid_segs2, seg_labels2 = assign_labels_to_segments(segments2[wl][ov], fs, wl, ov, label_points2)
-            valid_segments2[wl][ov] = valid_segs2
-            labeled_segments2[wl][ov] = seg_labels2
+#             print(f"\nProcessing Set 2 - Window Length: {wl}s, Overlap: {ov}")
+#             valid_segs2, seg_labels2 = assign_labels_to_segments(segments2[wl][ov], fs, wl, ov, label_points2)
+#             valid_segments2[wl][ov] = valid_segs2
+#             labeled_segments2[wl][ov] = seg_labels2
 # ---------------------------------
 # 3. Feature Extraction
 # ---------------------------------
@@ -724,89 +791,92 @@ elif feature_type == "nothing":
     features = piezo_values
     features2 = piezo_values2
 
-elif feature_type == "ar":
-    # ------------------------------------------------------------
-    # AR features & labels already aligned and split above
-    # ------------------------------------------------------------
-    features  = piezo_values      # [N_train × 88]
-    features2 = piezo_values2     # [N_test  × 88]
-
-    labels_train = label_points   # [N_train]
-    labels_test  = label_points2  # [N_test]
-
-    # Build labeled matrices
-    labeled_features  = np.hstack((features,  labels_train[:, None]))
-    labeled_features2 = np.hstack((features2, labels_test[:, None]))
-
-    print("AR labeled_features :", labeled_features.shape)
-    print("AR labeled_features2:", labeled_features2.shape)
+# elif feature_type == "ar":
+#     # AR features are already loaded above so skip
 
 
-else:
-    raise ValueError("Invalid type. Choose 'wavelet', 'stft', 'integral', 'nothing', or 'ar'.")
+#     # ------------------------------------------------------------
+#     # AR features & labels already aligned and split above
+#     # ------------------------------------------------------------
+#     features  = piezo_values      # [N_train × 88]
+#     features2 = piezo_values2     # [N_test  × 88]
+
+#     labels_train = label_points   # [N_train]
+#     labels_test  = label_points2  # [N_test]
+
+#     # Build labeled matrices
+#     labeled_features  = np.hstack((features,  labels_train[:, None]))
+#     labeled_features2 = np.hstack((features2, labels_test[:, None]))
+
+#     print("AR labeled_features :", labeled_features.shape)
+#     print("AR labeled_features2:", labeled_features2.shape)
+
+
+# else:
+#     raise ValueError("Invalid type. Choose 'wavelet', 'stft', 'integral', 'nothing', or 'ar'.")
 
 # Print the shapes for verification
-if feature_type == "nothing":
-    print(f"Using raw signals directly. Shape: {features.shape}")
-elif feature_type == "integral":
-    print(f"Using integral values. Shape: {features.shape}")
-else:
-    for wl in window_lengths:
-        for ov in overlaps:
-            if feature_type == "wavelet":
-                for w in wavelets:
-                    print(f"Window: {wl}s, Overlap: {ov}, Wavelet: {w}, Shape: {features[wl][ov][w].shape}")
-            elif feature_type == "stft":
-                print(f"Window: {wl}s, Overlap: {ov}, Shape: {features[wl][ov].shape}")
+# if feature_type == "nothing":
+#     print(f"Using raw signals directly. Shape: {features.shape}")
+# elif feature_type == "integral":
+#     print(f"Using integral values. Shape: {features.shape}")
+# else:
+#     for wl in window_lengths:
+#         for ov in overlaps:
+#             if feature_type == "wavelet":
+#                 for w in wavelets:
+#                     print(f"Window: {wl}s, Overlap: {ov}, Wavelet: {w}, Shape: {features[wl][ov][w].shape}")
+#             elif feature_type == "stft":
+#                 print(f"Window: {wl}s, Overlap: {ov}, Shape: {features[wl][ov].shape}")
 
-# ---------------------------------
-# 4. Combine Features and Labels
-# ---------------------------------
-labeled_features = {}
-labeled_features2 = {}
-if feature_type in ["nothing", "integral", "ar"]:
-    # Directly pair raw signals with labels
-    if len(label_points) != features.shape[0]:
-        raise ValueError(
-            f"Mismatch in raw signal: {features.shape[0]} samples vs {len(label_points)} labels."
-        )
-    labeled_features = np.hstack((features, label_points[:, None]))
-    labeled_features2 = np.hstack((features2, label_points2[:, None]))
+# # ---------------------------------
+# # 4. Combine Features and Labels
+# # ---------------------------------
+# labeled_features = {}
+# labeled_features2 = {}
+# if feature_type in ["nothing", "integral", "ar"]:
+#     # Directly pair raw signals with labels
+#     if len(label_points) != features.shape[0]:
+#         raise ValueError(
+#             f"Mismatch in raw signal: {features.shape[0]} samples vs {len(label_points)} labels."
+#         )
+#     labeled_features = np.hstack((features, label_points[:, None]))
+#     labeled_features2 = np.hstack((features2, label_points2[:, None]))
 
-else:
-    for wl in window_lengths:
-        labeled_features[wl] = {}
-        labeled_features2[wl] = {}
-        for ov in overlaps:
-            if feature_type == "wavelet":
-                labeled_features[wl][ov] = {}
-                labeled_features2[wl][ov] = {}
-                for w in wavelets:
-                    feature_matrix = features[wl][ov][w]
-                    feature_matrix2 = features2[wl][ov][w]
-                    if len(labeled_segments[wl][ov]) != feature_matrix.shape[0]:
-                        raise ValueError(
-                            f"Mismatch for window {wl}s, overlap {ov}, wavelet {w}: "
-                            f"{feature_matrix.shape[0]} features vs {len(labeled_segments[wl][ov])} labels."
-                        )
-                    # Append labels as the last column
-                    labeled_feature_matrix = np.hstack((feature_matrix, labeled_segments[wl][ov][:, None]))
-                    labeled_feature_matrix2 = np.hstack((feature_matrix2, labeled_segments2[wl][ov][:, None]))
-                    labeled_features[wl][ov][w] = labeled_feature_matrix
-                    labeled_features2[wl][ov][w] = labeled_feature_matrix2
-            elif feature_type == "stft":
-                feature_matrix = features[wl][ov]
-                feature_matrix2 = features2[wl][ov]
-                if len(labeled_segments[wl][ov]) != feature_matrix.shape[0]:
-                    raise ValueError(
-                        f"Mismatch for window {wl}s, overlap {ov}: "
-                        f"{feature_matrix.shape[0]} features vs {len(labeled_segments[wl][ov])} labels."
-                    )
-                # Append labels as the last column
-                labeled_feature_matrix = np.hstack((feature_matrix, labeled_segments[wl][ov][:, None]))
-                labeled_feature_matrix2 = np.hstack((feature_matrix2, labeled_segments2[wl][ov][:, None]))
-                labeled_features[wl][ov] = labeled_feature_matrix
-                labeled_features2[wl][ov] = labeled_feature_matrix2
+# else:
+#     for wl in window_lengths:
+#         labeled_features[wl] = {}
+#         labeled_features2[wl] = {}
+#         for ov in overlaps:
+#             if feature_type == "wavelet":
+#                 labeled_features[wl][ov] = {}
+#                 labeled_features2[wl][ov] = {}
+#                 for w in wavelets:
+#                     feature_matrix = features[wl][ov][w]
+#                     feature_matrix2 = features2[wl][ov][w]
+#                     if len(labeled_segments[wl][ov]) != feature_matrix.shape[0]:
+#                         raise ValueError(
+#                             f"Mismatch for window {wl}s, overlap {ov}, wavelet {w}: "
+#                             f"{feature_matrix.shape[0]} features vs {len(labeled_segments[wl][ov])} labels."
+#                         )
+#                     # Append labels as the last column
+#                     labeled_feature_matrix = np.hstack((feature_matrix, labeled_segments[wl][ov][:, None]))
+#                     labeled_feature_matrix2 = np.hstack((feature_matrix2, labeled_segments2[wl][ov][:, None]))
+#                     labeled_features[wl][ov][w] = labeled_feature_matrix
+#                     labeled_features2[wl][ov][w] = labeled_feature_matrix2
+#             elif feature_type == "stft":
+#                 feature_matrix = features[wl][ov]
+#                 feature_matrix2 = features2[wl][ov]
+#                 if len(labeled_segments[wl][ov]) != feature_matrix.shape[0]:
+#                     raise ValueError(
+#                         f"Mismatch for window {wl}s, overlap {ov}: "
+#                         f"{feature_matrix.shape[0]} features vs {len(labeled_segments[wl][ov])} labels."
+#                     )
+#                 # Append labels as the last column
+#                 labeled_feature_matrix = np.hstack((feature_matrix, labeled_segments[wl][ov][:, None]))
+#                 labeled_feature_matrix2 = np.hstack((feature_matrix2, labeled_segments2[wl][ov][:, None]))
+#                 labeled_features[wl][ov] = labeled_feature_matrix
+#                 labeled_features2[wl][ov] = labeled_feature_matrix2
 
 # ---------------------------------
 # 5. SVM Grid Search with Parallelism
@@ -822,44 +892,94 @@ def get_color_code(text):
         "\033[94m",  # Blue
         "\033[95m",  # Magenta
         "\033[96m",  # Cyan
+        "\033[38;5;94m",   # Brown / SaddleBrown
+        "\033[38;5;208m",  # Orange
+        "\033[38;5;205m",  # Pink / HotPink
+        "\033[38;5;250m",  # Silver / Gray
     ]
     hash_val = int(hashlib.md5(text.encode()).hexdigest(), 16)  # Generate a hash
     return colors[hash_val % len(colors)]  # Pick a color cyclically
 
-def train_and_evaluate_svm(wl, w, ov, C, gamma, kernel, X_train, y_train, X_test, y_test):
-    """Train an SVM and evaluate its accuracy."""
+def train_and_evaluate_svm(params):
+    """
+    params è un dizionario contenente TUTTI i parametri necessari:
+    - feature_type (wavelet, stft, ar, ecc.)
+    - order, wl, ov, fold
+    - C, gamma, kernel
+    - X_train, y_train, X_test, y_test
+    """
+
+    feature_type = params.get("feature_type", None)
+
+    order = params.get("order", None)
+    wl    = params.get("wl", None)
+    ov    = params.get("ov", None)
+    fold  = params.get("fold", None)
+
+    C      = params["C"]
+    gamma  = params["gamma"]
+    kernel = params["kernel"]
+
+    X_train = params["X_train"]
+    y_train = params["y_train"]
+    X_test  = params["X_test"]
+    y_test  = params["y_test"]
+
+    # ---------------------------
+    # BUILD HUMAN-READABLE PARAM STRING
+    # ---------------------------
     if feature_type == "wavelet":
-        param_set = f"Window: {wl}s, Wavelet: {w}, Overlap: {ov}, Kernel: {kernel}, Gamma: {gamma}, C: {C}"
+        param_set = f"Wl={wl}s, Wavelet={params['wavelet']}, Ov={ov}, C={C}, gamma={gamma}, kernel={kernel}"
+
     elif feature_type == "stft":
-        param_set = f"Window: {wl}s, Overlap: {ov}, Kernel: {kernel}, Gamma: {gamma}, C: {C}"
-    elif feature_type == "nothing":
-        param_set = f"Raw Signal, Kernel: {kernel}, Gamma: {gamma}, C: {C}"
-    elif feature_type == "integral":
-        param_set = f"Integral Signal, Kernel: {kernel}, Gamma: {gamma}, C: {C}"
+        param_set = f"STFT: Wl={wl}s, Ov={ov}, C={C}, gamma={gamma}, kernel={kernel}"
+
     elif feature_type == "ar":
-        param_set = f"AR Features, Kernel: {kernel}, Gamma: {gamma}, C: {C}"
+        param_set = (
+            f"AR(order={order}, wl={wl}, ov={ov}%, fold={fold}) | "
+            f"C={C}, gamma={gamma}, kernel={kernel}"
+        )
+
+    elif feature_type == "nothing":
+        param_set = f"Raw Signal | C={C}, gamma={gamma}, kernel={kernel}"
+
+    elif feature_type == "integral":
+        param_set = f"Integral | C={C}, gamma={gamma}, kernel={kernel}"
+
+    else:
+        param_set = f"Features | C={C}, gamma={gamma}, kernel={kernel}"
+
     color = get_color_code(param_set)
-    
+
     print(f"{color}[{time.strftime('%H:%M:%S')}] Started training with: {param_set}\033[0m")
-    
-    start_time = time.time()  # Track training time
-    
+
+    # ---------------------------
+    # TRAIN SVM
+    # ---------------------------
+    start_time = time.time()
     clf = SVC(kernel=kernel, gamma=gamma, C=C)
     clf.fit(X_train, y_train)
-    
-    training_time = time.time() - start_time  # Compute training duration
+    training_time = time.time() - start_time
+
+    # ---------------------------
+    # TEST
+    # ---------------------------
     y_pred = clf.predict(X_test)
     accuracy = accuracy_score(y_test, y_pred)
-    #accuracy = precision_score(y_test, y_pred, average='weighted')
     cm = confusion_matrix(y_test, y_pred)
-    
-    print(f"{color}[{time.strftime('%H:%M:%S')}] Finished training with: {param_set} (Accuracy: {accuracy:.4f}) - Took {training_time:.2f}s\033[0m")
-    
-    # Return results based on the feature_type
+
+    print(f"{color}[{time.strftime('%H:%M:%S')}] Finished: {param_set} "
+          f"(Accuracy: {accuracy:.4f}) Took {training_time:.2f}s\033[0m")
+
+    # ---------------------------
+    # RETURN RESULTS
+    # ---------------------------
     return {
-        "window_length": wl if feature_type not in ["nothing", "integral"] else None,
-        "wavelet": w if feature_type == "wavelet" else None,
-        "overlap": ov if feature_type not in ["nothing", "integral"] else None,
+        "feature_type": feature_type,
+        "order": order,
+        "window_length": wl,
+        "overlap": ov,
+        "fold": fold,
         "C": C,
         "gamma": gamma,
         "kernel": kernel,
@@ -1007,93 +1127,139 @@ def train_and_evaluate_hmm(wl, w, ov, X_train, y_train, X_test, y_test, unsuperv
             "models": best_models
         }
     
-# Prepare all parameter combinations (each tuple contains all required data)
-param_combinations = []
-if classifier == "svm":
-    if feature_type in ["nothing", "integral", "ar"]:
-        # AR behaves like nothing/integral → simple train/test split already done
-        for C in C_values:
-            for gamma in gamma_values:
-                for kernel in kernels:
-                    param_combinations.append(
-                        (None, None, None, C, gamma, kernel,
-                         labeled_features[:, :-1], labeled_features[:, -1],
-                         labeled_features2[:, :-1], labeled_features2[:, -1])
-                    )
+# # Prepare all parameter combinations (each tuple contains all required data)
+# if classifier == "svm":
+#     if feature_type in ["nothing", "integral", "ar"]:
+#         # AR behaves like nothing/integral → simple train/test split already done
+#         for C in C_values:
+#             for gamma in gamma_values:
+#                 for kernel in kernels:
+#                     param_combinations.append(
+#                         (None, None, None, C, gamma, kernel,
+#                          labeled_features[:, :-1], labeled_features[:, -1],
+#                          labeled_features2[:, :-1], labeled_features2[:, -1])
+#                     )
 
-    else:
-        # WAVELET or STFT
-        for wl in window_lengths:
-            for ov in overlaps:
-                if feature_type == "wavelet":
-                    for w in wavelets:
-                        for C in C_values:
-                            for gamma in gamma_values:
-                                for kernel in kernels:
-                                    param_combinations.append(
-                                        (wl, w, ov, C, gamma, kernel,
-                                         labeled_features[wl][ov][w][:, :-1],   labeled_features[wl][ov][w][:, -1],
-                                         labeled_features2[wl][ov][w][:, :-1],  labeled_features2[wl][ov][w][:, -1])
-                                    )
+#     else:
+#         # WAVELET or STFT
+#         for wl in window_lengths:
+#             for ov in overlaps:
+#                 if feature_type == "wavelet":
+#                     for w in wavelets:
+#                         for C in C_values:
+#                             for gamma in gamma_values:
+#                                 for kernel in kernels:
+#                                     param_combinations.append(
+#                                         (wl, w, ov, C, gamma, kernel,
+#                                          labeled_features[wl][ov][w][:, :-1],   labeled_features[wl][ov][w][:, -1],
+#                                          labeled_features2[wl][ov][w][:, :-1],  labeled_features2[wl][ov][w][:, -1])
+#                                     )
 
-                elif feature_type == "stft":
-                    for C in C_values:
-                        for gamma in gamma_values:
-                            for kernel in kernels:
-                                param_combinations.append(
-                                    (wl, None, ov, C, gamma, kernel,
-                                     labeled_features[wl][ov][:, :-1],   labeled_features[wl][ov][:, -1],
-                                     labeled_features2[wl][ov][:, :-1],  labeled_features2[wl][ov][:, -1])
-                                )
+#                 elif feature_type == "stft":
+#                     for C in C_values:
+#                         for gamma in gamma_values:
+#                             for kernel in kernels:
+#                                 param_combinations.append(
+#                                     (wl, None, ov, C, gamma, kernel,
+#                                      labeled_features[wl][ov][:, :-1],   labeled_features[wl][ov][:, -1],
+#                                      labeled_features2[wl][ov][:, :-1],  labeled_features2[wl][ov][:, -1])
+#                                 )
 
-if classifier == "hmm":
-    if feature_type  in ["nothing", "integral"]:
-        for n_states in n_states_values:
-            param_combinations.append(
-                (None, None, None, None, None, None,  # HMM does not use C, gamma, kernel
-                 labeled_features[:, :-1], labeled_features[:, -1],
-                 labeled_features2[:, :-1], labeled_features2[:, -1],
-                 n_states)
-            )
-    else:
-        for wl in window_lengths:
-            for ov in overlaps:
-                if feature_type == "wavelet":
-                    for w in wavelets:
-                        for n_states in n_states_values:
-                            param_combinations.append(
-                                (wl, w, ov, None, None, None,
-                                 labeled_features[wl][ov][w][:, :-1], labeled_features[wl][ov][w][:, -1],
-                                 labeled_features2[wl][ov][w][:, :-1], labeled_features2[wl][ov][w][:, -1],
-                                 n_states)
-                            )
-                elif feature_type == "stft":
-                    for n_states in n_states_values:
-                        param_combinations.append(
-                            (wl, None, ov, None, None, None,
-                             labeled_features[wl][ov][:, :-1], labeled_features[wl][ov][:, -1],
-                             labeled_features2[wl][ov][:, :-1], labeled_features2[wl][ov][:, -1],
-                             n_states)
-                        )
+# if classifier == "hmm":
+#     if feature_type  in ["nothing", "integral"]:
+#         for n_states in n_states_values:
+#             param_combinations.append(
+#                 (None, None, None, None, None, None,  # HMM does not use C, gamma, kernel
+#                  labeled_features[:, :-1], labeled_features[:, -1],
+#                  labeled_features2[:, :-1], labeled_features2[:, -1],
+#                  n_states)
+#             )
+#     else:
+#         for wl in window_lengths:
+#             for ov in overlaps:
+#                 if feature_type == "wavelet":
+#                     for w in wavelets:
+#                         for n_states in n_states_values:
+#                             param_combinations.append(
+#                                 (wl, w, ov, None, None, None,
+#                                  labeled_features[wl][ov][w][:, :-1], labeled_features[wl][ov][w][:, -1],
+#                                  labeled_features2[wl][ov][w][:, :-1], labeled_features2[wl][ov][w][:, -1],
+#                                  n_states)
+#                             )
+#                 elif feature_type == "stft":
+#                     for n_states in n_states_values:
+#                         param_combinations.append(
+#                             (wl, None, ov, None, None, None,
+#                              labeled_features[wl][ov][:, :-1], labeled_features[wl][ov][:, -1],
+#                              labeled_features2[wl][ov][:, :-1], labeled_features2[wl][ov][:, -1],
+#                              n_states)
+#                         )
 
 
 # Use joblib to process the SVM training in parallel
-num_cores = min(20, multiprocessing.cpu_count())
+num_cores = max(1, multiprocessing.cpu_count() - 1)
+
+print (f"Starting train using {num_cores} cores for parallel processing.")
 if classifier == "svm":
-    tasks = [delayed(train_and_evaluate_svm)(*params) for params in param_combinations]
+    tasks = [delayed(train_and_evaluate_svm)(p) for p in param_combinations]
+    results = Parallel(n_jobs=num_cores)(
+        tqdm(tasks, total=len(tasks), desc="Processing SVM")
+    )
+
 elif classifier == "hmm":
-    tasks = [delayed(train_and_evaluate_hmm)(*params[:3], params[6], params[7], params[8], params[9], unsupervised=unsupervised, initial_start_prob=initial_start_prob, initial_transition_matrix=initial_transition_matrix, n_states=params[10]) for params in param_combinations]    
-results_test_on_set2 = Parallel(n_jobs=num_cores)(tqdm(tasks, total=len(tasks), desc="Processing"))
+    tasks = [delayed(train_and_evaluate_hmm)(p) for p in param_combinations]
+    results = Parallel(n_jobs=num_cores)(
+        tqdm(tasks, total=len(tasks), desc="Processing HMM")
+    )
+
 
 if classifier == "svm":
-    best_result_test_on_set2 = max(results_test_on_set2, key=lambda x: x["accuracy"])
-    sorted_results = sorted(results_test_on_set2, key=lambda x: x["accuracy"], reverse=True)
+    sorted_results = sorted(results, key=lambda x: x["accuracy"], reverse=True)
+    best_result = sorted_results[0]
 elif classifier == "hmm":
-    # Use accuracy if available, otherwise fall back on likelihood score
-    best_result_test_on_set2 = max(results_test_on_set2, key=lambda x: x.get("accuracy", 0))
-    sorted_results = sorted(results_test_on_set2, key=lambda x: x.get("accuracy", 0), reverse=True)
+    sorted_results = sorted(results, key=lambda x: x.get("accuracy", 0), reverse=True)
+    best_result = sorted_results[0]
 
-for result in results_test_on_set2:
+print("\n=== VERIFYING TASK–RESULT MATCH ===")
+
+for i, (params, r) in enumerate(zip(param_combinations, results)):
+
+    ok = True
+    mismatches = []
+
+    # 1) AR metadata — with key mapping
+    key_map = {
+        "order": "order",
+        "wl": "window_length",
+        "ov": "overlap",
+        "fold": "fold"
+    }
+
+    for p_key, r_key in key_map.items():
+        if params[p_key] != r[r_key]:
+            ok = False
+            mismatches.append(f"{p_key} (params={params[p_key]}) != {r_key} (results={r[r_key]})")
+
+    # 2) SVM params (same names)
+    for key in ["C", "gamma", "kernel"]:
+        if params[key] != r[key]:
+            ok = False
+            mismatches.append(f"{key}: params={params[key]} vs results={r[key]}")
+
+    if not ok:
+        print(f"\n[ERROR] Mismatch at index {i}:")
+        for m in mismatches:
+            print("   " + m)
+        raise RuntimeError("❌ Task/result mismatch detected! STOP.")
+    else:
+        # Print only first few OK to avoid flooding console
+        if i < 3:
+            print(f"[OK] index {i}: params & results metadata match.")
+
+print("\n=== MATCH VERIFIED FOR ALL TASKS ===\n")
+
+
+for result in results:
     if classifier == "svm":
         if feature_type == "wavelet":
             print(f"Window: {result['window_length']}s, Wavelet: {result['wavelet']}, Overlap: {result['overlap']}, "
@@ -1109,6 +1275,11 @@ for result in results_test_on_set2:
         elif feature_type == "integral":
             print(f"Integral Signal, Kernel: {result['kernel']}, Gamma: {result['gamma']}, C: {result['C']}, "
                   f"accuracy: {result['accuracy']:.4f}")
+        elif feature_type == "ar":
+            print(
+                f"AR(order={result['order']}, wl={result['window_length']}, ov={result['overlap']}%, fold={result['fold']} | "
+                f"C={result['C']}, gamma={result['gamma']}, kernel={result['kernel']} | acc={result['accuracy']:.4f}"
+            )
     elif classifier == "hmm":
         print(f"Window: {result['window_length']}s, Overlap: {result['overlap']}, n_states: {result['n_states']} "
               f"Accuracy: {result.get('accuracy', 'N/A')}")
@@ -1131,140 +1302,325 @@ for i, result in enumerate(sorted_results[:30], start=1):
             print(f"Rank {i}: Integral Signal, Kernel: {result['kernel']}, Gamma: {result['gamma']}, C: {result['C']}, "
                   f"accuracy: {result['accuracy']:.4f}")
         elif feature_type == "ar":
-            print(f"Rank {i}: AR Features, Kernel: {result['kernel']}, Gamma: {result['gamma']}, C: {result['C']}, "
-                  f"accuracy: {result['accuracy']:.4f}")
+            print(
+                f"#{i} | AR(order={result['order']}, wl={result['window_length']}, ov={result['overlap']}%, fold={result['fold']}) | "
+                f"C={result['C']}, gamma={result['gamma']}, kernel={result['kernel']} | acc={result['accuracy']:.4f}")
     elif classifier == "hmm":
         print(f"Rank {i}: Window: {result['window_length']}s, Overlap: {result['overlap']}, "
               f"Accuracy: {result.get('accuracy', 'N/A')}")
 
-if classifier == "svm":
-    best_cm = best_result_test_on_set2["confusion_matrix"]
-elif classifier == "hmm" and "confusion_matrix" in best_result_test_on_set2:
-    best_cm = best_result_test_on_set2["confusion_matrix"]
-else:
-    best_cm = None  # No confusion matrix for unsupervised HMM
+# if classifier == "svm":
+#     best_cm = best_result_test_on_set2["confusion_matrix"]
+# elif classifier == "hmm" and "confusion_matrix" in best_result_test_on_set2:
+#     best_cm = best_result_test_on_set2["confusion_matrix"]
+# else:
+#     best_cm = None  # No confusion matrix for unsupervised HMM
 
-# Extract unique labels
-if feature_type in ["nothing", "integral", "ar"]:
-    unique_labels = np.unique(labeled_features2[:, -1])
-else:
-    if feature_type == "wavelet":
-        wl = best_result_test_on_set2["window_length"]
-        ov = best_result_test_on_set2["overlap"]
-        w = best_result_test_on_set2["wavelet"]
-        unique_labels = np.unique(labeled_features2[wl][ov][w][:, -1])
-    elif feature_type == "stft":
-        wl = best_result_test_on_set2["window_length"]
-        ov = best_result_test_on_set2["overlap"]
-        unique_labels = np.unique(labeled_features2[wl][ov][:, -1])
+# # Extract unique labels
+# if feature_type in ["nothing", "integral", "ar"]:
+#     unique_labels = np.unique(labeled_features2[:, -1])
+# else:
+#     if feature_type == "wavelet":
+#         wl = best_result_test_on_set2["window_length"]
+#         ov = best_result_test_on_set2["overlap"]
+#         w = best_result_test_on_set2["wavelet"]
+#         unique_labels = np.unique(labeled_features2[wl][ov][w][:, -1])
+#     elif feature_type == "stft":
+#         wl = best_result_test_on_set2["window_length"]
+#         ov = best_result_test_on_set2["overlap"]
+#         unique_labels = np.unique(labeled_features2[wl][ov][:, -1])
 
-# Plot Confusion Matrix if available
-if best_cm is not None:
-    best_cm_normalized = best_cm.astype('float') / best_cm.sum(axis=1)[:, np.newaxis]
+# # Plot Confusion Matrix if available
+# if best_cm is not None:
+#     best_cm_normalized = best_cm.astype('float') / best_cm.sum(axis=1)[:, np.newaxis]
 
-    plt.figure(figsize=(8, 6))
-    ax = sns.heatmap(best_cm_normalized, annot=True, fmt=".2%", cmap="Blues", 
-                     xticklabels=unique_labels, yticklabels=unique_labels,
-                     cbar_kws={'label': 'Number of Classifications'})  # Add label to the color bar
-    plt.xlabel("Predicted Labels")
-    plt.ylabel("True Labels")
+#     plt.figure(figsize=(8, 6))
+#     ax = sns.heatmap(best_cm_normalized, annot=True, fmt=".2%", cmap="Blues", 
+#                      xticklabels=unique_labels, yticklabels=unique_labels,
+#                      cbar_kws={'label': 'Number of Classifications'})  # Add label to the color bar
+#     plt.xlabel("Predicted Labels")
+#     plt.ylabel("True Labels")
 
-    # Add accuracy to the title
-    if classifier == "svm":
-        if feature_type == "nothing":
-            plt.title(
-                f"Confusion Matrix (Best: Raw Signal, Kernel: {best_result_test_on_set2['kernel']}, "
-                f"Gamma: {best_result_test_on_set2['gamma']}, C: {best_result_test_on_set2['C']}, "
-                f"Accuracy: {best_result_test_on_set2['accuracy']:.2%})"
-            )
-        elif feature_type == "integral":
-            plt.title(
-                f"Confusion Matrix (Best: Integral Signal, Kernel: {best_result_test_on_set2['kernel']}, "
-                f"Gamma: {best_result_test_on_set2['gamma']}, C: {best_result_test_on_set2['C']}, "
-                f"Accuracy: {best_result_test_on_set2['accuracy']:.2%})"
-            )
-        elif feature_type == "ar":
-            plt.title(
-                f"Confusion Matrix (Best AR Features, Kernel: {best_result_test_on_set2['kernel']}, "
-                f"Gamma: {best_result_test_on_set2['gamma']}, C: {best_result_test_on_set2['C']}, "
-                f"Accuracy: {best_result_test_on_set2['accuracy']:.2%})"
-            )
+#     # Add accuracy to the title
+#     if classifier == "svm":
+#         if feature_type == "nothing":
+#             plt.title(
+#                 f"Confusion Matrix (Best: Raw Signal, Kernel: {best_result_test_on_set2['kernel']}, "
+#                 f"Gamma: {best_result_test_on_set2['gamma']}, C: {best_result_test_on_set2['C']}, "
+#                 f"Accuracy: {best_result_test_on_set2['accuracy']:.2%})"
+#             )
+#         elif feature_type == "integral":
+#             plt.title(
+#                 f"Confusion Matrix (Best: Integral Signal, Kernel: {best_result_test_on_set2['kernel']}, "
+#                 f"Gamma: {best_result_test_on_set2['gamma']}, C: {best_result_test_on_set2['C']}, "
+#                 f"Accuracy: {best_result_test_on_set2['accuracy']:.2%})"
+#             )
+#         elif feature_type == "ar":
+#             plt.title(
+#                 f"Confusion Matrix (Best AR Features, Kernel: {best_result_test_on_set2['kernel']}, "
+#                 f"Gamma: {best_result_test_on_set2['gamma']}, C: {best_result_test_on_set2['C']}, "
+#                 f"Accuracy: {best_result_test_on_set2['accuracy']:.2%})"
+#             )
 
-        else:
-            plt.title(
-                f"Confusion Matrix (Best: Window: {best_result_test_on_set2['window_length']}s, "
-                f"Overlap: {best_result_test_on_set2['overlap']}, "
-                f"Kernel: {best_result_test_on_set2['kernel']}, "
-                f"Gamma: {best_result_test_on_set2['gamma']}, C: {best_result_test_on_set2['C']}, "
-                f"Accuracy: {best_result_test_on_set2['accuracy']:.2%})"
-            )
-    elif classifier == "hmm":
+#         else:
+#             plt.title(
+#                 f"Confusion Matrix (Best: Window: {best_result_test_on_set2['window_length']}s, "
+#                 f"Overlap: {best_result_test_on_set2['overlap']}, "
+#                 f"Kernel: {best_result_test_on_set2['kernel']}, "
+#                 f"Gamma: {best_result_test_on_set2['gamma']}, C: {best_result_test_on_set2['C']}, "
+#                 f"Accuracy: {best_result_test_on_set2['accuracy']:.2%})"
+#             )
+#     elif classifier == "hmm":
+#         plt.title(
+#             f"Confusion Matrix (Best: Window: {best_result_test_on_set2['window_length']}s, "
+#             f"Overlap: {best_result_test_on_set2['overlap']}, "
+#             f"Accuracy: {best_result_test_on_set2.get('accuracy', 'N/A')})"
+#         )
+
+#     # Adjust the color bar to reflect raw counts, if it exists
+#     cbar = ax.collections[0].colorbar  # Get the color bar from the heatmap
+#     if cbar:
+#         tick_labels = cbar.get_ticks()  # Get current tick positions
+#         cbar.set_ticks(tick_labels)  # Ensure ticks are properly set
+#         cbar.set_ticklabels([f"{int(t * best_cm.sum())}" for t in tick_labels])  # Convert to raw counts
+
+#     plt.show()
+# # Extract the correct feature matrix for prediction
+# if feature_type in ["nothing", "integral", "ar"]:
+#     X_test = labeled_features2[:, :-1]  # Features are all columns except the last
+#     y_test = labeled_features2[:, -1]   # Labels are the last column
+# else:
+#     # For wavelet or STFT, use the best parameters from the results
+#     wl = best_result_test_on_set2["window_length"]
+#     ov = best_result_test_on_set2["overlap"]
+#     if feature_type == "wavelet":
+#         w = best_result_test_on_set2["wavelet"]
+#         X_test = labeled_features2[wl][ov][w][:, :-1]  # Features are all columns except the last
+#         y_test = labeled_features2[wl][ov][w][:, -1]   # Labels are the last column
+#     elif feature_type == "stft":
+#         X_test = labeled_features2[wl][ov][:, :-1]  # Features are all columns except the last
+#         y_test = labeled_features2[wl][ov][:, -1]   # Labels are the last column
+
+# # Get the predicted labels for the test set
+# if classifier == "svm":
+#     y_pred = best_result_test_on_set2["model"].predict(X_test)
+# elif classifier == "hmm":
+#     if unsupervised:
+#         y_pred = best_result_test_on_set2["hidden_states_test"]
+#     else:
+#         y_pred = []
+#         for sample in X_test:
+#             scores = [model.score(sample.reshape(1, -1)) for model in best_result_test_on_set2["models"].values()]
+#             y_pred.append(unique_labels[np.argmax(scores)])
+#         y_pred = np.array(y_pred)
+
+# # Plot the test set with predicted classes
+# plt.figure(figsize=(10, 6))
+
+# for label in np.unique(y_pred):
+#     plt.scatter(
+#         np.where(y_pred == label)[0],  # X-axis: sample indices
+#         X_test[y_pred == label].mean(axis=1),  # Y-axis: mean feature value (or any other feature)
+#         label=f"Predicted Class {label}",
+#         alpha=0.6,
+#         s=0.5
+#     )
+# plt.plot(y_test, label="True Class", color="black", linestyle="--")
+# plt.xlabel("Sample Index")
+# plt.ylabel("Feature Value (Mean)")
+# plt.title("Test Set Classification Visualization")
+# plt.legend()
+# plt.grid()
+# plt.show()
+# if "model" in best_result_test_on_set2:
+#     joblib.dump(best_result_test_on_set2["model"], best_model_path)
+#     print(f"Saved single model to {best_model_path}")
+# elif "models" in best_result_test_on_set2:
+#     joblib.dump(best_result_test_on_set2["models"], best_model_path)
+#     print(f"Saved multiple models to {best_model_path}")
+# else:
+#     print("Error: Neither 'model' nor 'models' found in best_result_test_on_set2")
+
+###############################################################################
+# FINAL AR-SVM EVALUATION: SAVE ALL MODELS + CONFUSION MATRICES + CSV SUMMARY
+###############################################################################
+###############################################################################
+# ====================== AR FINAL EVALUATION ================================
+###############################################################################
+
+if feature_type == "ar":
+    print("\n==================== AR FINAL EVALUATION ====================\n")
+    print("Saving AR-SVM models, confusion matrices, and CSV summary...")
+
+    # Output directories
+    base_dir = os.path.join(script_dir, "data", "records_final", f"{finger}_{test}")
+
+    img_dir = os.path.join(base_dir, "img_CM")
+    model_dir = os.path.join(base_dir, "SVM_model")
+    csv_dir = os.path.join(base_dir, "csv_results")
+
+    os.makedirs(img_dir, exist_ok=True)
+    os.makedirs(model_dir, exist_ok=True)
+    os.makedirs(csv_dir, exist_ok=True)
+
+    ###########################################################################
+    # FIRST PASS: SAVE ALL FOLD-SPECIFIC MODELS + CONFUSION MATRICES
+    ###########################################################################
+
+    fold_csv_rows = []  # will accumulate rows for CSV
+
+    for params, r in zip(param_combinations, results):
+
+        X_test = params["X_test"]
+        y_test = params["y_test"]
+
+        model  = r["model"]
+        acc    = r["accuracy"]
+
+        # Compute confusion matrix for this fold
+        y_pred = model.predict(X_test)
+        cm = confusion_matrix(y_test, y_pred)
+
+        # Build fold mask (e.g. "10000", "01000", etc.)
+        fold_mask = "".join("1" if i == params["fold"] else "0" for i in range(5))
+
+        # Naming elements
+        a = params["order"]
+        b = params["wl"]
+        c = params["ov"]
+        d = params["kernel"]
+        e = params["gamma"]
+        f = params["C"]
+        g = fold_mask
+
+        # ================= SAVE CM FOR THIS FOLD =================
+        cm_name = f"{a}_{b}_{c}_{d}_{e}_{f}_{g}_CM.png"
+        cm_path = os.path.join(img_dir, cm_name)
+
+        plt.figure(figsize=(6, 5))
+        sns.heatmap(cm, annot=True, cmap="Blues", fmt="d")
         plt.title(
-            f"Confusion Matrix (Best: Window: {best_result_test_on_set2['window_length']}s, "
-            f"Overlap: {best_result_test_on_set2['overlap']}, "
-            f"Accuracy: {best_result_test_on_set2.get('accuracy', 'N/A')})"
+            f"AR-SVM Fold={params['fold']} | acc={acc:.3f}\n"
+            f"order={a}, wl={b}, ov={c}"
         )
+        plt.xlabel("Predicted")
+        plt.ylabel("True")
+        plt.tight_layout()
+        plt.savefig(cm_path)
+        plt.close()
 
-    # Adjust the color bar to reflect raw counts, if it exists
-    cbar = ax.collections[0].colorbar  # Get the color bar from the heatmap
-    if cbar:
-        tick_labels = cbar.get_ticks()  # Get current tick positions
-        cbar.set_ticks(tick_labels)  # Ensure ticks are properly set
-        cbar.set_ticklabels([f"{int(t * best_cm.sum())}" for t in tick_labels])  # Convert to raw counts
+        # ================= SAVE MODEL =================
+        model_name = f"{a}_{b}_{c}_{d}_{e}_{f}_{g}_SVM.pkl"
+        model_path = os.path.join(model_dir, model_name)
+        joblib.dump(model, model_path)
 
-    plt.show()
-# Extract the correct feature matrix for prediction
-if feature_type in ["nothing", "integral", "ar"]:
-    X_test = labeled_features2[:, :-1]  # Features are all columns except the last
-    y_test = labeled_features2[:, -1]   # Labels are the last column
-else:
-    # For wavelet or STFT, use the best parameters from the results
-    wl = best_result_test_on_set2["window_length"]
-    ov = best_result_test_on_set2["overlap"]
-    if feature_type == "wavelet":
-        w = best_result_test_on_set2["wavelet"]
-        X_test = labeled_features2[wl][ov][w][:, :-1]  # Features are all columns except the last
-        y_test = labeled_features2[wl][ov][w][:, -1]   # Labels are the last column
-    elif feature_type == "stft":
-        X_test = labeled_features2[wl][ov][:, :-1]  # Features are all columns except the last
-        y_test = labeled_features2[wl][ov][:, -1]   # Labels are the last column
+        # ================= CSV ROW =================
+        fold_csv_rows.append({
+            "order": a, "window_length": b, "overlap": c,
+            "kernel": d, "gamma": e, "C": f,
+            "fold": params["fold"], "fold_mask": g,
+            "accuracy": acc,
+            "train_time": r["training_time"],
+            "num_train_samples": len(params["y_train"]),
+            "num_test_samples": len(params["y_test"]),
+            "model_path": model_path,
+            "cm_path": cm_path
+        })
 
-# Get the predicted labels for the test set
-if classifier == "svm":
-    y_pred = best_result_test_on_set2["model"].predict(X_test)
-elif classifier == "hmm":
-    if unsupervised:
-        y_pred = best_result_test_on_set2["hidden_states_test"]
-    else:
-        y_pred = []
-        for sample in X_test:
-            scores = [model.score(sample.reshape(1, -1)) for model in best_result_test_on_set2["models"].values()]
-            y_pred.append(unique_labels[np.argmax(scores)])
-        y_pred = np.array(y_pred)
+    print("Saved all fold-specific CM and models.")
 
-# Plot the test set with predicted classes
-plt.figure(figsize=(10, 6))
+    ###########################################################################
+    # SECOND PASS: GROUP RESULTS AND COMPUTE MEAN CONFUSION MATRIX PER COMBO
+    ###########################################################################
 
-for label in np.unique(y_pred):
-    plt.scatter(
-        np.where(y_pred == label)[0],  # X-axis: sample indices
-        X_test[y_pred == label].mean(axis=1),  # Y-axis: mean feature value (or any other feature)
-        label=f"Predicted Class {label}",
-        alpha=0.6,
-        s=0.5
-    )
-plt.plot(y_test, label="True Class", color="black", linestyle="--")
-plt.xlabel("Sample Index")
-plt.ylabel("Feature Value (Mean)")
-plt.title("Test Set Classification Visualization")
-plt.legend()
-plt.grid()
-plt.show()
-if "model" in best_result_test_on_set2:
-    joblib.dump(best_result_test_on_set2["model"], best_model_path)
-    print(f"Saved single model to {best_model_path}")
-elif "models" in best_result_test_on_set2:
-    joblib.dump(best_result_test_on_set2["models"], best_model_path)
-    print(f"Saved multiple models to {best_model_path}")
-else:
-    print("Error: Neither 'model' nor 'models' found in best_result_test_on_set2")
+    from collections import defaultdict
+    groups = defaultdict(list)
+
+    # group results by (order, wl, ov, kernel, gamma, C)
+    for params, r in zip(param_combinations, results):
+        key = (
+            params["order"],
+            params["wl"],
+            params["ov"],
+            params["kernel"],
+            params["gamma"],
+            params["C"],
+        )
+        groups[key].append((params, r))
+
+    print("\nComputing MEAN confusion matrices for each AR+SVM combination...")
+
+    for key, entries in groups.items():
+        order, wl, ov, kernel, gamma, C = key
+
+        # Collect confusion matrices from all folds for this combination
+        cms = []
+        for params, r in entries:
+            X_test = params["X_test"]
+            y_test = params["y_test"]
+            y_pred = r["model"].predict(X_test)
+            cms.append(confusion_matrix(y_test, y_pred))
+
+        mean_cm = sum(cms) / len(cms)
+
+        # Save mean CM with fold_mask = "11111"
+        fold_mask = "11111"
+        mean_name = f"{order}_{wl}_{ov}_{kernel}_{gamma}_{C}_{fold_mask}_CM.png"
+        mean_path = os.path.join(img_dir, mean_name)
+
+        plt.figure(figsize=(6, 5))
+        sns.heatmap(
+            mean_cm / mean_cm.sum(axis=1)[:, None],
+            annot=True, fmt=".2f", cmap="Blues"
+        )
+        plt.title(
+            f"MEAN CM (5-fold)\norder={order}, wl={wl}, ov={ov}, "
+            f"kernel={kernel}, gamma={gamma}, C={C}"
+        )
+        plt.xlabel("Predicted")
+        plt.ylabel("True")
+        plt.tight_layout()
+        plt.savefig(mean_path)
+        plt.close()
+
+        print("Saved mean CM:", mean_path)
+
+        # Add CSV row for mean entry
+        mean_accuracy = np.mean([r["accuracy"] for (_, r) in entries])
+
+        fold_csv_rows.append({
+            "order": order, "window_length": wl, "overlap": ov,
+            "kernel": kernel, "gamma": gamma, "C": C,
+            "fold": "mean", "fold_mask": "11111",
+            "accuracy": mean_accuracy,
+            "train_time": "",
+            "num_train_samples": "",
+            "num_test_samples": "",
+            "model_path": "",
+            "cm_path": mean_path
+        })
+
+    ###########################################################################
+    # THIRD PASS: SAVE CSV FILE
+    ###########################################################################
+
+    csv_file_path = os.path.join(csv_dir, "AR_SVM.csv")
+
+    import csv
+    with open(csv_file_path, "w", newline="") as csv_file:
+        writer = csv.DictWriter(
+            csv_file,
+            fieldnames=[
+                "order", "window_length", "overlap",
+                "kernel", "gamma", "C",
+                "fold", "fold_mask",
+                "accuracy", "train_time",
+                "num_train_samples", "num_test_samples",
+                "model_path", "cm_path"
+            ]
+        )
+        writer.writeheader()
+        writer.writerows(fold_csv_rows)
+
+    print("\nSaved CSV summary:", csv_file_path)
+    print("\n==================== END AR FINAL EVALUATION ====================\n")
