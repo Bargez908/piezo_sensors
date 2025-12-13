@@ -77,10 +77,12 @@ folder1 = f"{test}_{finger}_{test_n}"
 folder2 = f"{test}_{finger}_{test_n+1}"
 classifier = "svm" # Choose between "svm" or "hmm"
 
-AR_orders = [5, 10]
-AR_window_lengths = [25, 100]
-AR_overlaps = [50]   # percentuali, NON 0.5
-
+AR_orders = [5, 10, 15]
+AR_orders = [5,10]
+AR_window_lengths = [25, 100, 400]
+AR_window_lengths = [100]
+AR_overlaps = [50, 100]   # percentuali, NON 0.5
+AR_overlaps = [50]
 # Define segmentation parameters for non ar features
 window_lengths = [0.2, 0.4]  # in seconds
 fs = 313
@@ -90,7 +92,9 @@ overlaps = [0.4, 0.6]  # Overlap percentage
 wavelets = ['db2', 'db3', 'db4', 'sym2', 'sym3', 'sym4', 'coif2', 'coif3', 'coif4']
 
 # Define SVM hyperparameters
-C_values = [2]
+C_values = [1/8, 1, 8]
+C_values = [1]
+gamma_values = ['scale', 1/8, 1, 8]
 gamma_values = ['scale']
 kernels = ['rbf']
 # initial_transition_matrix = np.array([[0.9, 0.1, 0, 0], 
@@ -1512,7 +1516,7 @@ if feature_type == "ar":
         # ================= SAVE MODEL =================
         model_name = f"{a}_{b}_{c}_{d}_{e}_{f}_{g}_SVM.pkl"
         model_path = os.path.join(model_dir, model_name)
-        joblib.dump(model, model_path)
+        #joblib.dump(model, model_path)
 
         # ================= CSV ROW =================
         fold_csv_rows.append({
@@ -1604,7 +1608,19 @@ if feature_type == "ar":
     # THIRD PASS: SAVE CSV FILE
     ###########################################################################
 
-    csv_file_path = os.path.join(csv_dir, "AR_SVM.csv")
+    # Build base filename
+    csv_base = os.path.join(csv_dir, "AR_SVM.csv")
+    csv_file_path = csv_base
+
+    # If file exists, append _1, _2, _3, ...
+    if os.path.exists(csv_file_path):
+        counter = 1
+        while True:
+            csv_file_path = os.path.join(csv_dir, f"AR_SVM_{counter}.csv")
+            if not os.path.exists(csv_file_path):
+                break
+            counter += 1
+
 
     import csv
     with open(csv_file_path, "w", newline="") as csv_file:
