@@ -1622,6 +1622,8 @@ if feature_type == "ar":
             f"MEAN CM (ABS) | acc={mean_accuracy:.4f}\n"
             f"order={order}, wl={wl}, ov={ov}, kernel={kernel}, gamma={gamma}, C={C}"
         )
+        plt.xlabel("Predicted")
+        plt.ylabel("True")
         plt.tight_layout()
         plt.savefig(mean_path_abs)
         plt.close()
@@ -1639,6 +1641,8 @@ if feature_type == "ar":
             f"MEAN CM (Normalized) | acc={mean_accuracy:.4f}\n"
             f"order={order}, wl={wl}, ov={ov}, kernel={kernel}, gamma={gamma}, C={C}"
         )
+        plt.xlabel("Predicted")
+        plt.ylabel("True")
         plt.tight_layout()
         plt.savefig(mean_path_norm)
         plt.close()
