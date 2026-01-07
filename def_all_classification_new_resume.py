@@ -1071,6 +1071,8 @@ def train_and_evaluate_svm(params):
         "kernel": kernel,
         "accuracy": accuracy,
         "confusion_matrix": cm,
+        "y_test": y_test,
+        "y_pred": y_pred,   
         "training_time": training_time,
         "model": clf
     }
@@ -1583,8 +1585,10 @@ if feature_type == "ar":
         model  = r["model"]
         acc    = r["accuracy"]
 
-        y_pred = model.predict(X_test)
-        cm = confusion_matrix(y_test, y_pred)
+        cm = r["confusion_matrix"]
+        y_pred = r["y_pred"]
+        y_test = r["y_test"]
+
 
         # Per-class metrics
         precision, recall, f1, support = precision_recall_fscore_support(
@@ -1685,18 +1689,9 @@ if feature_type == "ar":
         mean_accuracy = float(np.mean(accuracies))
         accuracy_std  = float(np.std(accuracies))
 
-        # Collect CM for each fold
-        cms = []
-        y_tests = []
-        y_preds = []
-
-        for params, r in entries:
-            X_test = params["X_test"]
-            y_test = params["y_test"]
-            y_pred = r["model"].predict(X_test)
-            cms.append(confusion_matrix(y_test, y_pred))
-            y_tests.append(y_test)
-            y_preds.append(y_pred)
+        cms = [r["confusion_matrix"] for (_, r) in entries]
+        y_tests = [r["y_test"] for (_, r) in entries]
+        y_preds = [r["y_pred"] for (_, r) in entries]
 
         mean_cm = sum(cms) / len(cms)
 
