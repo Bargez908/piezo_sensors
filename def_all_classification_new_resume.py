@@ -1731,7 +1731,7 @@ if feature_type == "ar":
         plt.savefig(mean_path_norm)
         plt.close()
 
-        print("Saved:", mean_path_abs, "and", mean_path_norm)
+        #print("Saved:", mean_path_abs, "and", mean_path_norm)
 
         # ---------- Derive per-class metrics for MEAN ----------
         y_test_all = np.concatenate(y_tests)
