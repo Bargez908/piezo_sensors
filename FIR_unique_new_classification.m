@@ -140,7 +140,8 @@ for lIdx = 1:numLabels
         
         % y: qui usi la LABEL come output costante (come hai richiesto)
         % se in futuro vuoi usare un sensore (es. forza), sostituisci qui.
-        y_win = lbl_val * ones(windowLength, 1);
+        % Trasla label di +1 per evitare y=0
+        y_win = (lbl_val + 1) * ones(windowLength, 1);
         
         for ch = 1:numChannels
             u_win = X_win(:, ch);
