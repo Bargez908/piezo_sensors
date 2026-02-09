@@ -102,6 +102,13 @@ if save_model
     end
 end
 
+[~, numChannels] = size(datasets(1).X);
+
+% Start parallel pool if not already running
+if isempty(gcp('nocreate'))
+    parpool('local');
+end
+
 combo_idx = 0;
 
 for wl = window_lengths
@@ -190,8 +197,8 @@ for wl = window_lengths
 
                     fprintf('  Label %d: %d windows\n', lbl_val, nWins);
 
-                    % Train FIR per channel, then average coefficients across windows
-                    for ch = 1:numChannels
+                    % Train FIR per channel in parallel, then average coefficients across windows
+                    parfor ch = 1:numChannels
                         coeff_matrix = zeros(nWins, nb_coeff);
 
                         for wIdx = 1:nWins
