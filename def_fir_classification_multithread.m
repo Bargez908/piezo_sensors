@@ -272,7 +272,7 @@ if test_fir
         error('Model folder not found: %s', save_root);
     end
 
-    test_output_root = fullfile(save_root, 'test_results');
+    test_output_root = fullfile(script_dir, 'data', macro_folder, [finger '_' test], 'csv_results', 'fir_test_results');
     if ~exist(test_output_root, 'dir')
         mkdir(test_output_root);
     end
@@ -280,7 +280,7 @@ if test_fir
     summary_table = test_saved_models(save_root, test_output_root, ...
         datasets, n_folds, na, nk, label_offset);
 
-    summary_csv = fullfile(test_output_root, 'all_models_error_variance.csv');
+    summary_csv = fullfile(test_output_root, 'all_models_pairwise_error_stats.csv');
     writetable(summary_table, summary_csv);
     fprintf('Saved test summary CSV: %s\n', summary_csv);
 end
@@ -420,21 +420,24 @@ function summary_table = test_saved_models(save_root, test_output_root, ...
             model_unique_labels = double(S.unique_labels(:));
             FIR_mean_matrix_fold = normalize_fir_matrix_shape(S.FIR_mean_matrix_fold, numel(model_unique_labels));
 
-            [pred_table, var_table] = evaluate_model_on_testset(model_name, test_ds, ...
-                datasets(test_ds), FIR_mean_matrix_fold, model_unique_labels, ...
+            [pred_table, var_table, equalization_table] = evaluate_model_on_testset(model_name, test_ds, ...
+                datasets, FIR_mean_matrix_fold, model_unique_labels, ...
                 windowLength, overlap, fir_order, model_label_offset);
 
             [~, model_base, ~] = fileparts(model_name);
-            pred_csv = fullfile(test_output_root, [model_base '_predictions.csv']);
-            var_csv  = fullfile(test_output_root, [model_base '_variance.csv']);
+            pred_csv = fullfile(test_output_root, [model_base '_predictions_pairwise.csv']);
+            var_csv  = fullfile(test_output_root, [model_base '_pairwise_error_stats.csv']);
+            eq_csv   = fullfile(test_output_root, [model_base '_equalization_counts.csv']);
             plot_png = fullfile(test_output_root, [model_base '_plot.png']);
 
             writetable(pred_table, pred_csv);
             writetable(var_table, var_csv);
+            writetable(equalization_table, eq_csv);
             save_prediction_plot(pred_table, model_name, test_ds, windowLength, overlap, fir_order, plot_png);
 
             fprintf('  Saved prediction CSV: %s\n', pred_csv);
-            fprintf('  Saved variance CSV:   %s\n', var_csv);
+            fprintf('  Saved pairwise CSV:   %s\n', var_csv);
+            fprintf('  Saved equalize CSV:   %s\n', eq_csv);
             fprintf('  Saved plot:           %s\n', plot_png);
 
             used_parts = used_parts + 1;
@@ -452,16 +455,19 @@ function summary_table = test_saved_models(save_root, test_output_root, ...
     end
 end
 
-function [pred_table, var_table] = evaluate_model_on_testset(model_name, test_ds, ...
-        test_dataset, FIR_mean_matrix_fold, model_unique_labels, ...
+function [pred_table, var_table, equalization_table] = evaluate_model_on_testset(model_name, test_ds, ...
+        datasets, FIR_mean_matrix_fold, model_unique_labels, ...
         windowLength, overlap, fir_order, model_label_offset)
 
     stepSize = max(1, floor(windowLength * (1 - overlap)));
-    [windows_per_label, idxRanges_per_label, ~] = window_and_filter( ...
-        test_dataset.X, test_dataset.labels, model_unique_labels, windowLength, stepSize);
+    [windows_per_dataset, idxRanges_per_dataset, counts_before, counts_after, global_min] = ...
+        window_filter_and_equalize_all_datasets(datasets, model_unique_labels, windowLength, stepSize);
+
+    test_windows_per_label = windows_per_dataset{test_ds};
+    test_idxRanges_per_label = idxRanges_per_dataset{test_ds};
 
     [model_numLabels, model_numChannels, ~] = size(FIR_mean_matrix_fold);
-    [~, test_numChannels] = size(test_dataset.X);
+    [~, test_numChannels] = size(datasets(test_ds).X);
 
     if model_numLabels ~= numel(model_unique_labels)
         error('Model labels mismatch in %s', model_name);
@@ -474,53 +480,66 @@ function [pred_table, var_table] = evaluate_model_on_testset(model_name, test_ds
     all_start_idx = [];
     all_true = [];
     all_true_raw = [];
+    all_fir = [];
+    all_fir_raw = [];
     all_pred = [];
     all_err = [];
 
-    label_values = model_unique_labels(:) + model_label_offset;
-    label_values_raw = model_unique_labels(:);
-    n_windows_by_label = zeros(model_numLabels, 1);
-    var_by_label = nan(model_numLabels, 1);
+    n_windows_by_pair = zeros(model_numLabels, model_numLabels);
+    mean_error_by_pair = nan(model_numLabels, model_numLabels);
+    var_error_by_pair = nan(model_numLabels, model_numLabels);
 
-    for lIdx = 1:model_numLabels
-        lbl_val = model_unique_labels(lIdx);
-        winCell = windows_per_label{lIdx};
-        idxCell = idxRanges_per_label{lIdx};
+    for trueIdx = 1:model_numLabels
+        true_lbl_val = model_unique_labels(trueIdx);
+        winCell = test_windows_per_label{trueIdx};
+        idxCell = test_idxRanges_per_label{trueIdx};
         nWins = numel(winCell);
 
-        n_windows_by_label(lIdx) = nWins;
         if nWins == 0
             continue;
         end
 
-        pred_vals = zeros(nWins, 1);
         start_vals = zeros(nWins, 1);
-
         for wIdx = 1:nWins
-            X_win = winCell{wIdx};
             start_vals(wIdx) = idxCell{wIdx}(1);
-
-            fir_coeffs_label = squeeze(FIR_mean_matrix_fold(lIdx, :, :));
-            pred_vals(wIdx) = predict_window_label(X_win, fir_coeffs_label);
         end
 
-        true_vals_raw = lbl_val * ones(nWins, 1);
-        true_vals = (lbl_val + model_label_offset) * ones(nWins, 1);
-        err_vals = pred_vals - true_vals;
+        true_vals_raw = true_lbl_val * ones(nWins, 1);
+        true_vals = (true_lbl_val + model_label_offset) * ones(nWins, 1);
 
-        all_start_idx = [all_start_idx; start_vals]; %#ok<AGROW>
-        all_true = [all_true; true_vals]; %#ok<AGROW>
-        all_true_raw = [all_true_raw; true_vals_raw]; %#ok<AGROW>
-        all_pred = [all_pred; pred_vals]; %#ok<AGROW>
-        all_err = [all_err; err_vals]; %#ok<AGROW>
+        for firIdx = 1:model_numLabels
+            fir_lbl_val = model_unique_labels(firIdx);
+            fir_coeffs_label = squeeze(FIR_mean_matrix_fold(firIdx, :, :));
 
-        var_by_label(lIdx) = var(err_vals, 0);
+            pred_vals = zeros(nWins, 1);
+            for wIdx = 1:nWins
+                X_win = winCell{wIdx};
+                pred_vals(wIdx) = predict_window_label(X_win, fir_coeffs_label);
+            end
+
+            err_vals = pred_vals - true_vals;
+            fir_vals_raw = fir_lbl_val * ones(nWins, 1);
+            fir_vals = (fir_lbl_val + model_label_offset) * ones(nWins, 1);
+
+            all_start_idx = [all_start_idx; start_vals]; %#ok<AGROW>
+            all_true = [all_true; true_vals]; %#ok<AGROW>
+            all_true_raw = [all_true_raw; true_vals_raw]; %#ok<AGROW>
+            all_fir = [all_fir; fir_vals]; %#ok<AGROW>
+            all_fir_raw = [all_fir_raw; fir_vals_raw]; %#ok<AGROW>
+            all_pred = [all_pred; pred_vals]; %#ok<AGROW>
+            all_err = [all_err; err_vals]; %#ok<AGROW>
+
+            n_windows_by_pair(trueIdx, firIdx) = nWins;
+            mean_error_by_pair(trueIdx, firIdx) = mean(err_vals);
+            var_error_by_pair(trueIdx, firIdx) = var(err_vals, 0);
+        end
     end
 
     if isempty(all_start_idx)
         pred_table = empty_prediction_table();
     else
-        [start_idx_sorted, order_idx] = sort(all_start_idx);
+        sort_keys = [all_start_idx, all_true_raw, all_fir_raw];
+        [~, order_idx] = sortrows(sort_keys, [1 2 3]);
         n_window = (1:numel(order_idx)).';
 
         n_rows = numel(order_idx);
@@ -531,28 +550,159 @@ function [pred_table, var_table] = evaluate_model_on_testset(model_name, test_ds
             repmat(overlap, n_rows, 1), ...
             repmat(fir_order, n_rows, 1), ...
             n_window, ...
-            start_idx_sorted, ...
+            all_start_idx(order_idx), ...
             all_true_raw(order_idx), ...
             all_true(order_idx), ...
+            all_fir_raw(order_idx), ...
+            all_fir(order_idx), ...
             all_pred(order_idx), ...
             all_err(order_idx), ...
             'VariableNames', {'model_file', 'test_dataset', 'window_length', ...
             'overlap', 'fir_order', 'n_window', 'start_idx', ...
-            'true_label_raw', 'true_label', 'predicted_label', 'prediction_error'});
+            'true_label_raw', 'true_label', 'fir_label_raw', 'fir_label', ...
+            'predicted_label', 'prediction_error'});
     end
 
-    var_table = table( ...
-        repmat({model_name}, model_numLabels, 1), ...
-        repmat(test_ds, model_numLabels, 1), ...
-        repmat(windowLength, model_numLabels, 1), ...
-        repmat(overlap, model_numLabels, 1), ...
-        repmat(fir_order, model_numLabels, 1), ...
-        label_values_raw, ...
-        label_values, ...
-        n_windows_by_label, ...
-        var_by_label, ...
+    var_table = build_pairwise_error_table(model_name, test_ds, ...
+        windowLength, overlap, fir_order, model_unique_labels, model_label_offset, ...
+        n_windows_by_pair, mean_error_by_pair, var_error_by_pair, global_min);
+
+    equalization_table = build_equalization_table(model_name, test_ds, ...
+        windowLength, overlap, fir_order, model_unique_labels, model_label_offset, ...
+        counts_before, counts_after, global_min);
+end
+
+function [windows_per_dataset, idxRanges_per_dataset, counts_before, counts_after, global_min] = ...
+        window_filter_and_equalize_all_datasets(datasets, unique_labels, windowLength, stepSize)
+
+    n_folds = numel(datasets);
+    numLabels = numel(unique_labels);
+
+    windows_per_dataset = cell(n_folds, 1);
+    idxRanges_per_dataset = cell(n_folds, 1);
+    counts_before = zeros(n_folds, numLabels);
+
+    for d = 1:n_folds
+        [windows_per_label, idxRanges_per_label, ~] = window_and_filter( ...
+            datasets(d).X, datasets(d).labels, unique_labels, windowLength, stepSize);
+
+        windows_per_dataset{d} = windows_per_label;
+        idxRanges_per_dataset{d} = idxRanges_per_label;
+
+        for lIdx = 1:numLabels
+            counts_before(d, lIdx) = numel(windows_per_label{lIdx});
+        end
+    end
+
+    global_min = min(counts_before(:));
+    counts_after = counts_before;
+
+    for d = 1:n_folds
+        for lIdx = 1:numLabels
+            nW = numel(windows_per_dataset{d}{lIdx});
+            if nW > global_min
+                windows_per_dataset{d}{lIdx} = windows_per_dataset{d}{lIdx}(1:global_min);
+                idxRanges_per_dataset{d}{lIdx} = idxRanges_per_dataset{d}{lIdx}(1:global_min);
+            end
+            counts_after(d, lIdx) = numel(windows_per_dataset{d}{lIdx});
+        end
+    end
+end
+
+function t = build_pairwise_error_table(model_name, test_ds, windowLength, overlap, ...
+        fir_order, model_unique_labels, model_label_offset, ...
+        n_windows_by_pair, mean_error_by_pair, var_error_by_pair, global_min)
+
+    model_numLabels = numel(model_unique_labels);
+    n_pairs = model_numLabels * model_numLabels;
+
+    true_label_raw = zeros(n_pairs, 1);
+    true_label = zeros(n_pairs, 1);
+    fir_label_raw = zeros(n_pairs, 1);
+    fir_label = zeros(n_pairs, 1);
+    n_windows = zeros(n_pairs, 1);
+    error_mean = nan(n_pairs, 1);
+    error_variance = nan(n_pairs, 1);
+
+    row_idx = 0;
+    for trueIdx = 1:model_numLabels
+        for firIdx = 1:model_numLabels
+            row_idx = row_idx + 1;
+            true_lbl_val = model_unique_labels(trueIdx);
+            fir_lbl_val = model_unique_labels(firIdx);
+
+            true_label_raw(row_idx) = true_lbl_val;
+            true_label(row_idx) = true_lbl_val + model_label_offset;
+            fir_label_raw(row_idx) = fir_lbl_val;
+            fir_label(row_idx) = fir_lbl_val + model_label_offset;
+            n_windows(row_idx) = n_windows_by_pair(trueIdx, firIdx);
+            error_mean(row_idx) = mean_error_by_pair(trueIdx, firIdx);
+            error_variance(row_idx) = var_error_by_pair(trueIdx, firIdx);
+        end
+    end
+
+    t = table( ...
+        repmat({model_name}, n_pairs, 1), ...
+        repmat(test_ds, n_pairs, 1), ...
+        repmat(windowLength, n_pairs, 1), ...
+        repmat(overlap, n_pairs, 1), ...
+        repmat(fir_order, n_pairs, 1), ...
+        repmat(global_min, n_pairs, 1), ...
+        true_label_raw, ...
+        true_label, ...
+        fir_label_raw, ...
+        fir_label, ...
+        n_windows, ...
+        error_mean, ...
+        error_variance, ...
         'VariableNames', {'model_file', 'test_dataset', 'window_length', ...
-        'overlap', 'fir_order', 'label_raw', 'label', 'n_windows', 'error_variance'});
+        'overlap', 'fir_order', 'global_min_windows', ...
+        'true_label_raw', 'true_label', 'fir_label_raw', 'fir_label', ...
+        'n_windows', 'error_mean', 'error_variance'});
+end
+
+function t = build_equalization_table(model_name, test_ds, windowLength, overlap, ...
+        fir_order, model_unique_labels, model_label_offset, ...
+        counts_before, counts_after, global_min)
+
+    [n_folds, numLabels] = size(counts_before);
+    n_rows = n_folds * numLabels;
+
+    dataset_idx = zeros(n_rows, 1);
+    label_raw = zeros(n_rows, 1);
+    label = zeros(n_rows, 1);
+    n_windows_before = zeros(n_rows, 1);
+    n_windows_after = zeros(n_rows, 1);
+
+    row_idx = 0;
+    for d = 1:n_folds
+        for lIdx = 1:numLabels
+            row_idx = row_idx + 1;
+            label_val = model_unique_labels(lIdx);
+
+            dataset_idx(row_idx) = d;
+            label_raw(row_idx) = label_val;
+            label(row_idx) = label_val + model_label_offset;
+            n_windows_before(row_idx) = counts_before(d, lIdx);
+            n_windows_after(row_idx) = counts_after(d, lIdx);
+        end
+    end
+
+    t = table( ...
+        repmat({model_name}, n_rows, 1), ...
+        repmat(test_ds, n_rows, 1), ...
+        repmat(windowLength, n_rows, 1), ...
+        repmat(overlap, n_rows, 1), ...
+        repmat(fir_order, n_rows, 1), ...
+        repmat(global_min, n_rows, 1), ...
+        dataset_idx, ...
+        label_raw, ...
+        label, ...
+        n_windows_before, ...
+        n_windows_after, ...
+        'VariableNames', {'model_file', 'test_dataset', 'window_length', ...
+        'overlap', 'fir_order', 'global_min_windows', ...
+        'dataset_idx', 'label_raw', 'label', 'n_windows_before', 'n_windows_after'});
 end
 
 function pred_label = predict_window_label(X_win, fir_coeffs_label)
@@ -642,11 +792,20 @@ function save_prediction_plot(pred_table, model_name, test_ds, ...
 
     fig = figure('Visible', 'off');
     if height(pred_table) > 0
-        plot(pred_table.n_window, pred_table.true_label, '.', 'DisplayName', 'True label');
-        hold on;
-        plot(pred_table.n_window, pred_table.predicted_label, '.', 'DisplayName', 'Predicted label');
-        hold off;
-        legend('Location', 'best');
+        if any(strcmp('fir_label_raw', pred_table.Properties.VariableNames))
+            plot_mask = pred_table.true_label_raw == pred_table.fir_label_raw;
+        else
+            plot_mask = true(height(pred_table), 1);
+        end
+
+        if any(plot_mask)
+            plot(pred_table.n_window(plot_mask), pred_table.true_label(plot_mask), '.', 'DisplayName', 'True label');
+            hold on;
+            plot(pred_table.n_window(plot_mask), pred_table.predicted_label(plot_mask), '.', ...
+                'DisplayName', 'Predicted label (diag FIR)');
+            hold off;
+            legend('Location', 'best');
+        end
     end
     xlabel('n\_window');
     ylabel('label value');
@@ -660,15 +819,19 @@ end
 function t = empty_prediction_table()
     t = table(cell(0, 1), zeros(0, 1), zeros(0, 1), zeros(0, 1), zeros(0, 1), ...
         zeros(0, 1), zeros(0, 1), zeros(0, 1), zeros(0, 1), zeros(0, 1), ...
-        zeros(0, 1), ...
+        zeros(0, 1), zeros(0, 1), ...
         'VariableNames', {'model_file', 'test_dataset', 'window_length', ...
         'overlap', 'fir_order', 'n_window', 'start_idx', ...
-        'true_label_raw', 'true_label', 'predicted_label', 'prediction_error'});
+        'true_label_raw', 'true_label', 'fir_label_raw', 'fir_label', ...
+        'predicted_label', 'prediction_error'});
 end
 
 function t = empty_variance_table()
     t = table(cell(0, 1), zeros(0, 1), zeros(0, 1), zeros(0, 1), zeros(0, 1), ...
-        zeros(0, 1), zeros(0, 1), zeros(0, 1), zeros(0, 1), ...
+        zeros(0, 1), zeros(0, 1), zeros(0, 1), zeros(0, 1), zeros(0, 1), ...
+        zeros(0, 1), zeros(0, 1), zeros(0, 1), ...
         'VariableNames', {'model_file', 'test_dataset', 'window_length', ...
-        'overlap', 'fir_order', 'label_raw', 'label', 'n_windows', 'error_variance'});
+        'overlap', 'fir_order', 'global_min_windows', ...
+        'true_label_raw', 'true_label', 'fir_label_raw', 'fir_label', ...
+        'n_windows', 'error_mean', 'error_variance'});
 end
