@@ -429,16 +429,20 @@ function summary_table = test_saved_models(save_root, test_output_root, ...
             var_csv  = fullfile(test_output_root, [model_base '_pairwise_error_stats.csv']);
             eq_csv   = fullfile(test_output_root, [model_base '_equalization_counts.csv']);
             plot_png = fullfile(test_output_root, [model_base '_plot.png']);
+            cm_png   = fullfile(test_output_root, [model_base '_pairwise_var_cm.png']);
 
             writetable(pred_table, pred_csv);
             writetable(var_table, var_csv);
             writetable(equalization_table, eq_csv);
             save_prediction_plot(pred_table, model_name, test_ds, windowLength, overlap, fir_order, plot_png);
+            save_pairwise_variance_cm(var_table, model_name, test_ds, windowLength, overlap, fir_order, cm_png);
+
 
             fprintf('  Saved prediction CSV: %s\n', pred_csv);
             fprintf('  Saved pairwise CSV:   %s\n', var_csv);
             fprintf('  Saved equalize CSV:   %s\n', eq_csv);
             fprintf('  Saved plot:           %s\n', plot_png);
+            fprintf('  Saved CM plot:        %s\n', cm_png);
 
             used_parts = used_parts + 1;
             summary_parts{used_parts} = var_table;
@@ -452,6 +456,11 @@ function summary_table = test_saved_models(save_root, test_output_root, ...
         summary_table = empty_variance_table();
     else
         summary_table = vertcat(summary_parts{1:used_parts});
+        summary_avg = build_fold_average_rows(summary_table, n_folds);
+        if height(summary_avg) > 0
+            summary_table = [summary_table; summary_avg];
+            save_fold_average_pairwise_cms(summary_avg, test_output_root, n_folds);
+        end
     end
 end
 
@@ -703,6 +712,241 @@ function t = build_equalization_table(model_name, test_ds, windowLength, overlap
         'VariableNames', {'model_file', 'test_dataset', 'window_length', ...
         'overlap', 'fir_order', 'global_min_windows', ...
         'dataset_idx', 'label_raw', 'label', 'n_windows_before', 'n_windows_after'});
+end
+
+function summary_avg = build_fold_average_rows(summary_table, n_folds)
+    if height(summary_table) == 0
+        summary_avg = empty_variance_table();
+        return;
+    end
+
+    model_names = summary_table.model_file;
+    is_fold_row = false(height(summary_table), 1);
+
+    for r = 1:height(summary_table)
+        model_name = model_names{r};
+        token = regexp(model_name, '^FIR_MODEL_(\d+)_([0-9]+(?:\.[0-9]+)?)_(\d+)_([01]+)\.mat$', ...
+            'tokens', 'once');
+        if isempty(token)
+            continue;
+        end
+        fold_mask = token{4};
+        if numel(fold_mask) == n_folds && sum(fold_mask == '1') == 1
+            is_fold_row(r) = true;
+        end
+    end
+
+    fold_rows = summary_table(is_fold_row, :);
+    if height(fold_rows) == 0
+        summary_avg = empty_variance_table();
+        return;
+    end
+
+    group_keys = [fold_rows.window_length, fold_rows.overlap, fold_rows.fir_order, ...
+        fold_rows.true_label_raw, fold_rows.fir_label_raw];
+    [unique_keys, ~, key_idx] = unique(group_keys, 'rows', 'stable');
+
+    n_groups = size(unique_keys, 1);
+    avg_model_file = cell(n_groups, 1);
+    avg_test_dataset = zeros(n_groups, 1);
+    avg_window_length = zeros(n_groups, 1);
+    avg_overlap = zeros(n_groups, 1);
+    avg_fir_order = zeros(n_groups, 1);
+    avg_global_min_windows = zeros(n_groups, 1);
+    avg_true_label_raw = zeros(n_groups, 1);
+    avg_true_label = zeros(n_groups, 1);
+    avg_fir_label_raw = zeros(n_groups, 1);
+    avg_fir_label = zeros(n_groups, 1);
+    avg_n_windows = zeros(n_groups, 1);
+    avg_error_mean = nan(n_groups, 1);
+    avg_error_variance = nan(n_groups, 1);
+
+    fold_mask_avg = repmat('1', 1, n_folds);
+
+    for g = 1:n_groups
+        rows_g = (key_idx == g);
+        wl = unique_keys(g, 1);
+        ov = unique_keys(g, 2);
+        nb = unique_keys(g, 3);
+        true_lbl_raw = unique_keys(g, 4);
+        fir_lbl_raw = unique_keys(g, 5);
+
+        avg_model_file{g} = sprintf('FIR_MODEL_%d_%.2f_%d_%s.mat', round(wl), ov, round(nb), fold_mask_avg);
+        avg_test_dataset(g) = 0;
+        avg_window_length(g) = wl;
+        avg_overlap(g) = ov;
+        avg_fir_order(g) = nb;
+        avg_global_min_windows(g) = mean(fold_rows.global_min_windows(rows_g), 'omitnan');
+        avg_true_label_raw(g) = true_lbl_raw;
+        avg_true_label(g) = mean(fold_rows.true_label(rows_g), 'omitnan');
+        avg_fir_label_raw(g) = fir_lbl_raw;
+        avg_fir_label(g) = mean(fold_rows.fir_label(rows_g), 'omitnan');
+        avg_n_windows(g) = mean(fold_rows.n_windows(rows_g), 'omitnan');
+        avg_error_mean(g) = mean(fold_rows.error_mean(rows_g), 'omitnan');
+        avg_error_variance(g) = mean(fold_rows.error_variance(rows_g), 'omitnan');
+    end
+
+    summary_avg = table( ...
+        avg_model_file, ...
+        avg_test_dataset, ...
+        avg_window_length, ...
+        avg_overlap, ...
+        avg_fir_order, ...
+        avg_global_min_windows, ...
+        avg_true_label_raw, ...
+        avg_true_label, ...
+        avg_fir_label_raw, ...
+        avg_fir_label, ...
+        avg_n_windows, ...
+        avg_error_mean, ...
+        avg_error_variance, ...
+        'VariableNames', {'model_file', 'test_dataset', 'window_length', ...
+        'overlap', 'fir_order', 'global_min_windows', ...
+        'true_label_raw', 'true_label', 'fir_label_raw', 'fir_label', ...
+        'n_windows', 'error_mean', 'error_variance'});
+end
+
+function save_fold_average_pairwise_cms(summary_avg, test_output_root, n_folds)
+    if height(summary_avg) == 0
+        return;
+    end
+
+    combo_keys = [summary_avg.window_length, summary_avg.overlap, summary_avg.fir_order];
+    [unique_combos, ~, combo_idx] = unique(combo_keys, 'rows', 'stable');
+
+    fold_mask_avg = repmat('1', 1, n_folds);
+
+    for c = 1:size(unique_combos, 1)
+        rows_c = (combo_idx == c);
+        rows_table = summary_avg(rows_c, :);
+
+        wl = unique_combos(c, 1);
+        ov = unique_combos(c, 2);
+        nb = unique_combos(c, 3);
+
+        model_name = sprintf('FIR_MODEL_%d_%.2f_%d_%s.mat', round(wl), ov, round(nb), fold_mask_avg);
+        cm_png = fullfile(test_output_root, ...
+            sprintf('FIR_MODEL_%d_%.2f_%d_%s_pairwise_var_cm.png', round(wl), ov, round(nb), fold_mask_avg));
+
+        save_pairwise_variance_cm(rows_table, model_name, 0, wl, ov, nb, cm_png);
+
+    end
+end
+
+function save_pairwise_variance_cm(var_table, ~, test_ds, ...
+        windowLength, overlap, fir_order, cm_png)
+
+    if height(var_table) == 0
+        return;
+    end
+
+    true_labels = unique(var_table.true_label_raw, 'sorted');
+    fir_labels = unique(var_table.fir_label_raw, 'sorted');
+
+    n_true = numel(true_labels);
+    n_fir = numel(fir_labels);
+    var_matrix = nan(n_true, n_fir);
+
+    for r = 1:height(var_table)
+        t_lbl = var_table.true_label_raw(r);
+        f_lbl = var_table.fir_label_raw(r);
+        v_err = var_table.error_variance(r);
+
+        t_idx = find(true_labels == t_lbl, 1, 'first');
+        f_idx = find(fir_labels == f_lbl, 1, 'first');
+        if ~isempty(t_idx) && ~isempty(f_idx)
+            var_matrix(t_idx, f_idx) = v_err;
+        end
+    end
+
+    fig = figure('Visible', 'off', 'Color', 'w', 'Position', [100 100 600 500]);
+    h_img = imagesc(var_matrix);
+    axis equal tight;
+
+    % Colormap similar to seaborn/matplotlib "Blues"
+    blues_anchors = [ ...
+        0.9686 0.9843 1.0000; ...
+        0.8706 0.9216 0.9686; ...
+        0.7765 0.8588 0.9373; ...
+        0.6196 0.7922 0.8824; ...
+        0.4196 0.6824 0.8392; ...
+        0.2200 0.5200 0.7600; ...
+        0.0850 0.3600 0.6400; ...
+        0.0180 0.2500 0.5200];
+    x_anchors = linspace(0, 1, size(blues_anchors, 1));
+    x_query = linspace(0, 1, 256);
+    cmap = interp1(x_anchors, blues_anchors, x_query, 'linear');
+    colormap(gca, cmap);
+
+    % Slightly softer rendering to match seaborn look
+    alpha_data = 0.90 * ones(size(var_matrix));
+    alpha_data(isnan(var_matrix)) = 0;
+    set(h_img, 'AlphaData', alpha_data);
+
+    ui_gray = [0 0 0];
+
+    cb = colorbar;
+    cb.Label.String = 'Error variance';
+    cb.Label.Color = ui_gray;
+    cb.Color = ui_gray;
+    cb.FontSize = 10;
+    set(gca, 'YDir', 'normal');
+    set(gca, 'Color', 'w', 'FontSize', 10, 'XColor', ui_gray, 'YColor', ui_gray, 'LineWidth', 0.7);
+    set(gca, 'XTick', 1:n_fir, 'XTickLabel', arrayfun(@num2str, fir_labels, 'UniformOutput', false));
+    set(gca, 'YTick', 1:n_true, 'YTickLabel', arrayfun(@num2str, true_labels, 'UniformOutput', false));
+
+    xlabel('FIR label', 'Color', ui_gray, 'FontSize', 11, 'FontWeight', 'normal');
+    ylabel('True label', 'Color', ui_gray, 'FontSize', 11, 'FontWeight', 'normal');
+    if test_ds > 0
+        title(sprintf('FIR | Fold=%d | wl=%d, ov=%.2f, nb=%d', ...
+            test_ds, round(windowLength), overlap, round(fir_order)), ...
+            'Interpreter', 'none', 'FontSize', 12, 'FontWeight', 'normal', 'Color', ui_gray);
+    else
+        title(sprintf('FIR | Fold=11111 | wl=%d, ov=%.2f, nb=%d', ...
+            round(windowLength), overlap, round(fir_order)), ...
+            'Interpreter', 'none', 'FontSize', 12, 'FontWeight', 'normal', 'Color', ui_gray);
+    end
+
+    var_min = min(var_matrix(:), [], 'omitnan');
+    var_max = max(var_matrix(:), [], 'omitnan');
+    if isfinite(var_min) && isfinite(var_max) && (var_max > var_min)
+        clim([var_min, var_max]);
+    end
+
+    for i = 1:n_true
+        for j = 1:n_fir
+            v = var_matrix(i, j);
+            if isnan(v)
+                txt = 'NaN';
+                txt_color = [0 0 0];
+            else
+                txt = sprintf('%.3g', v);
+                txt_color = [0 0 0];
+
+                if isfinite(var_min) && isfinite(var_max) && (var_max > var_min)
+                    norm_v = (v - var_min) / (var_max - var_min);
+                    norm_v = max(0, min(1, norm_v));
+                    cidx = 1 + floor(norm_v * (size(cmap, 1) - 1));
+                    cell_rgb = cmap(cidx, :);
+                    a_cell = alpha_data(i, j);
+                    shown_rgb = a_cell * cell_rgb + (1 - a_cell) * [1 1 1];
+                    luminance = 0.2126 * shown_rgb(1) + 0.7152 * shown_rgb(2) + 0.0722 * shown_rgb(3);
+
+                    if luminance < 0.55
+                        txt_color = [1 1 1];
+                    end
+                end
+            end
+            text(j, i, txt, 'HorizontalAlignment', 'center', 'Color', txt_color, ...
+                'FontSize', 10, 'FontWeight', 'normal');
+        end
+    end
+
+    box off;
+    grid off;
+    set(fig, 'InvertHardcopy', 'off');
+    saveas(fig, cm_png);
+    close(fig);
 end
 
 function pred_label = predict_window_label(X_win, fir_coeffs_label)
