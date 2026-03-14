@@ -91,6 +91,10 @@ AR_orders = [5, 10, 15]
 AR_window_lengths = [25, 100, 400]
 
 AR_overlaps = [50, 100]   # percentuali, NON 0.5
+AR_FEATURE_MODE = "spectrum"  # "coeff" or "spectrum"
+AR_SPEC_BINS = 64
+AR_SPEC_LOG_DB = True
+AR_SPEC_EPS = 1e-12
 
 # Define segmentation parameters for non ar features
 window_lengths = [0.2, 0.4]  # in seconds
@@ -131,6 +135,37 @@ elif classifier == "hmm":
     best_model_path = os.path.join(script_dir, test, f"best_hmm_model_{type}.joblib")
 
 
+def ar_spectrum_features(ar_coeffs, noise_var, n_bins=64, use_db=True, eps=1e-12):
+    """
+    Build AR spectral features from Burg coefficients.
+    Inputs:
+      ar_coeffs: [channels, order+1, windows]
+      noise_var: [channels, windows]
+    Output:
+      features: [windows, channels * n_bins]
+    """
+    channels, order_plus_one, windows = ar_coeffs.shape
+    order = order_plus_one - 1
+
+    # Drop a0=1 and keep a1..ap
+    a = ar_coeffs[:, 1:, :]  # [C, p, W]
+
+    # Frequency grid in normalized digital frequency (0..pi -> 0..Nyquist)
+    w = np.linspace(0.0, np.pi, n_bins, endpoint=True)
+    k = np.arange(1, order + 1)[:, None]  # [p, 1]
+    exp_term = np.exp(-1j * k * w[None, :])  # [p, F]
+
+    # Denominator: A(e^jw) = 1 + sum_k a_k e^{-jwk}
+    den = 1.0 + np.einsum("cpw,pf->cwf", a, exp_term)  # [C, W, F]
+
+    # PSD: sigma^2 / |A(e^jw)|^2
+    psd = noise_var[:, :, None] / (np.abs(den) ** 2 + eps)
+    if use_db:
+        psd = 10.0 * np.log10(psd + eps)
+
+    return psd.transpose(1, 0, 2).reshape(windows, -1)
+
+
 def load_ar_set(base_path, order, wl, ov):
     """
     Load AR coefficients and noise variances for a given (order, window_len, overlap).
@@ -145,17 +180,23 @@ def load_ar_set(base_path, order, wl, ov):
     noiseVar = np.load(noise_path)
     labels = np.load(labels_path)
 
-    # Remove AR(0) coeff = 1
-    # print("AR_coeffs shape:", AR_coeffs.shape)
-    # print("noiseVar shape:", noiseVar.shape)
-    AR_trim = AR_coeffs[:, 1:, :]
-    noise_exp = noiseVar[:, None, :]
-    # print("AR_trim shape:", AR_trim.shape)
-    # print("noise_exp shape:", noise_exp.shape)
-    AR_full = np.concatenate([AR_trim, noise_exp], axis=1)
-
-    N = AR_full.shape[2]
-    features = AR_full.transpose(2,0,1).reshape(N, -1)
+    if AR_FEATURE_MODE == "coeff":
+        # Legacy mode: raw AR coeffs + noise variance
+        AR_trim = AR_coeffs[:, 1:, :]
+        noise_exp = noiseVar[:, None, :]
+        AR_full = np.concatenate([AR_trim, noise_exp], axis=1)
+        N = AR_full.shape[2]
+        features = AR_full.transpose(2, 0, 1).reshape(N, -1)
+    elif AR_FEATURE_MODE == "spectrum":
+        features = ar_spectrum_features(
+            AR_coeffs,
+            noiseVar,
+            n_bins=AR_SPEC_BINS,
+            use_db=AR_SPEC_LOG_DB,
+            eps=AR_SPEC_EPS
+        )
+    else:
+        raise ValueError(f"Unsupported AR_FEATURE_MODE: {AR_FEATURE_MODE}")
 
     return features, labels
 
