@@ -4,12 +4,13 @@ import argparse
 import matplotlib.pyplot as plt
 import seaborn as sns
 import hashlib
+import csv
 from scipy.stats import mode
 from scipy.signal import butter, filtfilt
 import os
 from sklearn.svm import SVC
 from hmmlearn import hmm
-from sklearn.metrics import confusion_matrix, accuracy_score, precision_score
+from sklearn.metrics import confusion_matrix, accuracy_score, precision_score, precision_recall_fscore_support
 from joblib import Parallel, delayed
 import multiprocessing
 from tqdm import tqdm
@@ -87,14 +88,38 @@ folder2 = f"{test}_{finger}_{test_n+1}"
 classifier = "svm" # Choose between "svm" or "hmm"
 
 AR_orders = [5, 10, 15]
+#AR_orders = [10]
 
 AR_window_lengths = [25, 100, 400]
-
+#AR_window_lengths = [100]
 AR_overlaps = [50, 100]   # percentuali, NON 0.5
+#AR_overlaps = [50]   # percentuali, NON 0.5
+
 AR_FEATURE_MODE = "spectrum"  # "coeff" or "spectrum"
 AR_SPEC_BINS = 64
-AR_SPEC_LOG_DB = True
-AR_SPEC_EPS = 1e-12
+AR_SPEC_LOG_DB = False
+AR_SPEC_EPS = 0 # 1e-12
+AR_EXPECTED_FOLDS = 5
+AR_SVM_TITLE_PREFIX = "SPECTRAL AR-SVM" if AR_FEATURE_MODE == "spectrum" else "AR-SVM"
+AR_SVM_CSV_FILENAME = "SPECTRAL_AR_SVM.csv" if AR_FEATURE_MODE == "spectrum" else "AR_SVM.csv"
+AR_SVM_CSV_FIELDNAMES = [
+    "order", "window_length", "overlap",
+    "kernel", "gamma", "C",
+    "fold", "fold_mask",
+    "accuracy", "accuracy_std",
+    "train_time",
+    "gamma_eff",
+    "num_support_vectors",
+    "support_vectors_per_class",
+    "true_counts",
+    "pred_counts",
+    "precision",
+    "recall",
+    "f1",
+    "model_path",
+    "cm_path",
+    "cm_npy_path",
+]
 
 # Define segmentation parameters for non ar features
 window_lengths = [0.2, 0.4]  # in seconds
@@ -133,6 +158,92 @@ if classifier == "svm":
     best_model_path = os.path.join(script_dir, test, f"best_svm_model_{type}.joblib")
 elif classifier == "hmm":
     best_model_path = os.path.join(script_dir, test, f"best_hmm_model_{type}.joblib")
+
+
+def build_fold_mask(fold_idx, n_folds=AR_EXPECTED_FOLDS):
+    """Encode fold index as one-hot string mask (e.g., fold 2 -> 00100)."""
+    return "".join("1" if i == fold_idx else "0" for i in range(n_folds))
+
+
+def ar_combo_key(order, wl, ov, kernel, gamma, C):
+    """Stable key for one AR+SVM hyperparameter combination."""
+    return (int(float(order)), int(float(wl)), int(float(ov)), str(kernel), str(gamma), str(C))
+
+
+def checkpoint_ar_fold_result(result):
+    """
+    Persist one AR+SVM fold result immediately (CM image + CM npy + CSV row).
+    This protects completed folds from being lost if the process crashes later.
+    """
+    base_dir = os.path.join(script_dir, "data", "records_final", f"{finger}_{test}")
+    img_dir = os.path.join(base_dir, "img_CM")
+    model_dir = os.path.join(base_dir, "SVM_model")
+    csv_dir = os.path.join(base_dir, "csv_results")
+    csv_file_path = os.path.join(csv_dir, AR_SVM_CSV_FILENAME)
+
+    os.makedirs(img_dir, exist_ok=True)
+    os.makedirs(model_dir, exist_ok=True)
+    os.makedirs(csv_dir, exist_ok=True)
+
+    a = result["order"]
+    b = result["window_length"]
+    c = result["overlap"]
+    d = result["kernel"]
+    e = result["gamma"]
+    f = result["C"]
+    fold = int(result["fold"])
+    g = build_fold_mask(fold)
+
+    acc = float(result["accuracy"])
+    cm = np.asarray(result["confusion_matrix"], dtype=float)
+
+    cm_name = f"{a}_{b}_{c}_{d}_{e}_{f}_{g}_CM.png"
+    cm_path = os.path.join(img_dir, cm_name)
+    cm_npy_name = f"{a}_{b}_{c}_{d}_{e}_{f}_{g}_CM.npy"
+    cm_npy_path = os.path.join(img_dir, cm_npy_name)
+    np.save(cm_npy_path, cm)
+
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, cmap="Blues", fmt=".0f")
+    plt.title(
+        f"{AR_SVM_TITLE_PREFIX} Fold={fold} | acc={acc:.4f}\n"
+        f"order={a}, wl={b}, ov={c}, kernel={d}, gamma={e}, C={f}"
+    )
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.tight_layout()
+    plt.savefig(cm_path)
+    plt.close()
+
+    model_name = f"{a}_{b}_{c}_{d}_{e}_{f}_{g}_SVM.pkl"
+    model_path = os.path.join(model_dir, model_name)
+
+    row = {
+        "order": a, "window_length": b, "overlap": c,
+        "kernel": d, "gamma": e, "C": f,
+        "fold": fold, "fold_mask": g,
+        "accuracy": float(f"{acc:.4f}"),
+        "accuracy_std": "",
+        "train_time": float(f"{result['training_time']:.2f}"),
+        "gamma_eff": float(f"{result['gamma_eff']:.6f}"),
+        "num_support_vectors": int(result["num_support_vectors"]),
+        "support_vectors_per_class": result["support_vectors_per_class"],
+        "true_counts": result["true_counts"],
+        "pred_counts": [int(v) for v in result["pred_counts"]],
+        "precision": [float(f"{v:.4f}") for v in result["precision"]],
+        "recall": [float(f"{v:.4f}") for v in result["recall"]],
+        "f1": [float(f"{v:.4f}") for v in result["f1"]],
+        "model_path": model_path,
+        "cm_path": cm_path,
+        "cm_npy_path": cm_npy_path,
+    }
+
+    file_exists = os.path.exists(csv_file_path)
+    with open(csv_file_path, "a", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=AR_SVM_CSV_FIELDNAMES)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({name: row.get(name, "") for name in AR_SVM_CSV_FIELDNAMES})
 
 
 def ar_spectrum_features(ar_coeffs, noise_var, n_bins=64, use_db=True, eps=1e-12):
@@ -562,6 +673,7 @@ if feature_type == "ar":
             p["fold"]
         )
     )
+    all_param_combinations = list(param_combinations)
 
     # ============================================================
     # RESUME MODE — FILTER param_combinations USING CSV
@@ -571,28 +683,32 @@ if feature_type == "ar":
         print("\n[RESUME MODE] Checking existing CSV to skip completed runs...")
 
         csv_dir = os.path.join(script_dir, "data", "records_final", f"{finger}_{test}", "csv_results")
-        csv_path = os.path.join(csv_dir, "AR_SVM.csv")
+        csv_path = os.path.join(csv_dir, AR_SVM_CSV_FILENAME)
 
         done_keys = set()
 
         if os.path.exists(csv_path):
-            import csv
             with open(csv_path, "r", newline="") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    # usiamo fold_mask perché è univoco
-                    key = (
-                        int(row["order"]),
-                        int(row["window_length"]),
-                        int(row["overlap"]),
-                        str(row["kernel"]),
-                        str(row["gamma"]),
-                        str(row["C"]),
-                        row["fold_mask"]
-                    )
+                    # Skip mean rows; resume should skip only fold runs.
+                    if row.get("fold") == "mean":
+                        continue
+                    try:
+                        key = (
+                            int(float(row["order"])),
+                            int(float(row["window_length"])),
+                            int(float(row["overlap"])),
+                            str(row["kernel"]),
+                            str(row["gamma"]),
+                            str(row["C"]),
+                            str(row["fold_mask"]),
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        continue
                     done_keys.add(key)
 
-            print(f"[RESUME MODE] Found {len(done_keys)} completed entries in CSV.")
+            print(f"[RESUME MODE] Found {len(done_keys)} completed fold entries in CSV.")
 
         else:
             print("[RESUME MODE] No CSV found → starting from scratch.")
@@ -602,7 +718,7 @@ if feature_type == "ar":
         skipped = 0
 
         for p in param_combinations:
-            fold_mask = "".join("1" if i == p["fold"] else "0" for i in range(5))
+            fold_mask = build_fold_mask(p["fold"])
 
             key = (
                 p["order"],
@@ -1027,6 +1143,29 @@ def get_color_code(text):
     hash_val = int(hashlib.md5(text.encode()).hexdigest(), 16)  # Generate a hash
     return colors[hash_val % len(colors)]  # Pick a color cyclically
 
+def metrics_from_confusion_matrix(cm):
+    """
+    Compute per-class precision/recall/f1 and counts directly from a confusion matrix.
+    Works for integer or float-valued matrices.
+    """
+    cm = np.asarray(cm, dtype=float)
+    tp = np.diag(cm)
+    true_counts = cm.sum(axis=1)
+    pred_counts = cm.sum(axis=0)
+
+    precision = np.divide(tp, pred_counts, out=np.zeros_like(tp), where=pred_counts > 0)
+    recall = np.divide(tp, true_counts, out=np.zeros_like(tp), where=true_counts > 0)
+    f1 = np.divide(2 * precision * recall, precision + recall,
+                   out=np.zeros_like(tp), where=(precision + recall) > 0)
+
+    return (
+        precision.tolist(),
+        recall.tolist(),
+        f1.tolist(),
+        [int(round(v)) for v in true_counts.tolist()],
+        [int(round(v)) for v in pred_counts.tolist()]
+    )
+
 def train_and_evaluate_svm(params):
     """
     params è un dizionario contenente TUTTI i parametri necessari:
@@ -1095,6 +1234,13 @@ def train_and_evaluate_svm(params):
     accuracy = accuracy_score(y_test, y_pred)
     cm = confusion_matrix(y_test, y_pred)
 
+    labels_eval = np.unique(y_test)
+    precision, recall, f1, support = precision_recall_fscore_support(
+        y_test, y_pred, labels=labels_eval, zero_division=0
+    )
+    pred_counts = [int(np.sum(y_pred == lbl)) for lbl in labels_eval]
+    true_counts = [int(v) for v in support.tolist()]
+
     print(f"{color}[{time.strftime('%H:%M:%S')}] Finished: {param_set} "
           f"(Accuracy: {accuracy:.4f}) Took {training_time:.2f}s\033[0m")
 
@@ -1112,10 +1258,15 @@ def train_and_evaluate_svm(params):
         "kernel": kernel,
         "accuracy": accuracy,
         "confusion_matrix": cm,
-        "y_test": y_test,
-        "y_pred": y_pred,   
         "training_time": training_time,
-        "model": clf
+        "gamma_eff": float(clf._gamma),
+        "num_support_vectors": int(len(clf.support_)),
+        "support_vectors_per_class": [int(v) for v in clf.n_support_.tolist()],
+        "true_counts": true_counts,
+        "pred_counts": pred_counts,
+        "precision": [float(v) for v in precision.tolist()],
+        "recall": [float(v) for v in recall.tolist()],
+        "f1": [float(v) for v in f1.tolist()]
     }
 
 def train_and_evaluate_hmm(wl, w, ov, X_train, y_train, X_test, y_test, unsupervised=True, initial_start_prob=None, initial_transition_matrix=None, n_states=2):
@@ -1336,8 +1487,13 @@ if classifier == "svm":
 
     try:
         # return_as="generator" ti permette di ottenere i risultati appena finiscono
-        parallel = Parallel(n_jobs=num_cores, batch_size=1, return_as="generator")
+        parallel = Parallel(n_jobs=num_cores, batch_size=1, return_as="generator_unordered")
         for r in tqdm(parallel(tasks), total=len(param_combinations), desc="Processing SVM"):
+            if feature_type == "ar":
+                try:
+                    checkpoint_ar_fold_result(r)
+                except Exception as exc:
+                    print(f"[WARN] Could not checkpoint AR fold result: {exc}")
             results.append(r)
 
     except KeyboardInterrupt:
@@ -1363,48 +1519,46 @@ elif classifier == "hmm":
 
 if classifier == "svm":
     sorted_results = sorted(results, key=lambda x: x["accuracy"], reverse=True)
-    best_result = sorted_results[0]
 elif classifier == "hmm":
     sorted_results = sorted(results, key=lambda x: x.get("accuracy", 0), reverse=True)
-    best_result = sorted_results[0]
+else:
+    sorted_results = []
 
-print("\n=== VERIFYING TASK–RESULT MATCH ===")
+best_result = sorted_results[0] if sorted_results else None
+if best_result is None:
+    print("\n[INFO] No new training runs completed in this execution.")
 
-for i, (params, r) in enumerate(zip(param_combinations, results)):
+print("\n=== VERIFYING TASK-RESULT MATCH ===")
 
-    ok = True
-    mismatches = []
-
-    # 1) AR metadata — with key mapping
-    key_map = {
-        "order": "order",
-        "wl": "window_length",
-        "ov": "overlap",
-        "fold": "fold"
+if classifier == "svm" and feature_type == "ar":
+    expected_keys = {
+        (
+            p["order"], p["wl"], p["ov"], p["fold"],
+            str(p["kernel"]), str(p["gamma"]), str(p["C"]),
+        )
+        for p in param_combinations
     }
+    result_keys = [
+        (
+            r["order"], r["window_length"], r["overlap"], r["fold"],
+            str(r["kernel"]), str(r["gamma"]), str(r["C"]),
+        )
+        for r in results
+    ]
+    unexpected = [k for k in result_keys if k not in expected_keys]
+    duplicates = len(set(result_keys)) != len(result_keys)
 
-    for p_key, r_key in key_map.items():
-        if params[p_key] != r[r_key]:
-            ok = False
-            mismatches.append(f"{p_key} (params={params[p_key]}) != {r_key} (results={r[r_key]})")
+    if unexpected:
+        print(f"\n[ERROR] Found {len(unexpected)} unexpected result keys.")
+        raise RuntimeError("Task/result mismatch detected! STOP.")
+    if duplicates:
+        print("\n[ERROR] Duplicate result keys detected.")
+        raise RuntimeError("Duplicate task/result detected! STOP.")
 
-    # 2) SVM params (same names)
-    for key in ["C", "gamma", "kernel"]:
-        if params[key] != r[key]:
-            ok = False
-            mismatches.append(f"{key}: params={params[key]} vs results={r[key]}")
-
-    if not ok:
-        print(f"\n[ERROR] Mismatch at index {i}:")
-        for m in mismatches:
-            print("   " + m)
-        raise RuntimeError("❌ Task/result mismatch detected! STOP.")
-    else:
-        # Print only first few OK to avoid flooding console
-        if i < 3:
-            print(f"[OK] index {i}: params & results metadata match.")
-
-print("\n=== MATCH VERIFIED FOR ALL TASKS ===\n")
+    print(f"[OK] Verified {len(result_keys)} result keys against {len(expected_keys)} expected tasks.")
+    print("\n=== MATCH VERIFIED FOR ALL TASKS ===\n")
+else:
+    print("[INFO] Task/result key verification skipped for current configuration.\n")
 
 
 for result in results:
@@ -1597,8 +1751,6 @@ for i, result in enumerate(sorted_results[:30], start=1):
 ###############################################################################
 
 from collections import defaultdict
-from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
-import csv
 
 if feature_type == "ar":
     print("\n==================== AR FINAL EVALUATION ====================\n")
@@ -1613,61 +1765,84 @@ if feature_type == "ar":
     os.makedirs(model_dir, exist_ok=True)
     os.makedirs(csv_dir, exist_ok=True)
 
+    csv_file_path = os.path.join(csv_dir, AR_SVM_CSV_FILENAME)
+    mean_fold_mask = "1" * AR_EXPECTED_FOLDS
+
+    fieldnames = AR_SVM_CSV_FIELDNAMES
+
+    def make_row_key(order, wl, ov, kernel, gamma, C, fold_mask):
+        return ar_combo_key(order, wl, ov, kernel, gamma, C) + (str(fold_mask),)
+
+    def parse_csv_row_key(row):
+        try:
+            return make_row_key(
+                row["order"], row["window_length"], row["overlap"],
+                row["kernel"], row["gamma"], row["C"],
+                row["fold_mask"],
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def candidate_cm_npy_path(row):
+        cm_npy_path = str(row.get("cm_npy_path", "")).strip()
+        if cm_npy_path:
+            return cm_npy_path
+        cm_path = str(row.get("cm_path", "")).strip()
+        if cm_path:
+            return os.path.splitext(cm_path)[0] + ".npy"
+        return ""
+
+    rows_by_key = {}
+    if os.path.exists(csv_file_path):
+        with open(csv_file_path, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                row_key = parse_csv_row_key(row)
+                if row_key is None:
+                    continue
+                rows_by_key[row_key] = {name: row.get(name, "") for name in fieldnames}
+
+    updated_combo_keys = set()
+
     ###########################################################################
-    # 1) SAVE ALL FOLD-SPECIFIC CM + MODELS + CSV ROWS
+    # 1) SAVE/UPDATE ALL FOLD-SPECIFIC CM + CSV ROWS
     ###########################################################################
 
-    csv_rows = []
+    for r in results:
+        acc = r["accuracy"]
+        cm = np.asarray(r["confusion_matrix"], dtype=float)
+        precision = r["precision"]
+        recall = r["recall"]
+        f1 = r["f1"]
+        pred_counts = r["pred_counts"]
+        true_counts = r["true_counts"]
+        gamma_eff = r["gamma_eff"]
+        n_support_total = r["num_support_vectors"]
+        n_support_per_class = r["support_vectors_per_class"]
 
-    for params, r in zip(param_combinations, results):
+        a = r["order"]
+        b = r["window_length"]
+        c = r["overlap"]
+        d = r["kernel"]
+        e = r["gamma"]
+        f = r["C"]
+        g = build_fold_mask(r["fold"])
 
-        X_test = params["X_test"]
-        y_test = params["y_test"]
-        model  = r["model"]
-        acc    = r["accuracy"]
+        combo_key = ar_combo_key(a, b, c, d, e, f)
+        updated_combo_keys.add(combo_key)
+        row_key = combo_key + (g,)
 
-        cm = r["confusion_matrix"]
-        y_pred = r["y_pred"]
-        y_test = r["y_test"]
-
-
-        # Per-class metrics
-        precision, recall, f1, support = precision_recall_fscore_support(
-            y_test, y_pred, labels=np.unique(y_test), zero_division=0
-        )
-
-        # Predicted counts per class
-        pred_counts = [np.sum(y_pred == lbl) for lbl in np.unique(y_test)]
-
-        # True counts per class from support already available
-        true_counts = support.tolist()
-
-        # gamma effective
-        gamma_eff = model._gamma
-
-        # support vectors info
-        n_support_total = len(model.support_)
-        n_support_per_class = model.n_support_.tolist()
-
-        fold_mask = "".join("1" if i == params["fold"] else "0" for i in range(5))
-
-        # Naming
-        a = params["order"]
-        b = params["wl"]
-        c = params["ov"]
-        d = params["kernel"]
-        e = params["gamma"]
-        f = params["C"]
-        g = fold_mask
-
-        # ========================== SAVE CM FOR THIS FOLD ==========================
+        # Save confusion matrix image and npy for this fold
         cm_name = f"{a}_{b}_{c}_{d}_{e}_{f}_{g}_CM.png"
         cm_path = os.path.join(img_dir, cm_name)
+        cm_npy_name = f"{a}_{b}_{c}_{d}_{e}_{f}_{g}_CM.npy"
+        cm_npy_path = os.path.join(img_dir, cm_npy_name)
+        np.save(cm_npy_path, cm)
 
         plt.figure(figsize=(6, 5))
-        sns.heatmap(cm, annot=True, cmap="Blues", fmt="d")
+        sns.heatmap(cm, annot=True, cmap="Blues", fmt=".0f")
         plt.title(
-            f"AR-SVM Fold={params['fold']} | acc={acc:.4f}\n"
+            f"{AR_SVM_TITLE_PREFIX} Fold={r['fold']} | acc={acc:.4f}\n"
             f"order={a}, wl={b}, ov={c}, kernel={d}, gamma={e}, C={f}"
         )
         plt.xlabel("Predicted")
@@ -1676,16 +1851,14 @@ if feature_type == "ar":
         plt.savefig(cm_path)
         plt.close()
 
-        # ========================== SAVE MODEL ==========================
+        # Model name reserved (model dump currently disabled)
         model_name = f"{a}_{b}_{c}_{d}_{e}_{f}_{g}_SVM.pkl"
         model_path = os.path.join(model_dir, model_name)
-        #joblib.dump(model, model_path)
 
-        # ========================== SAVE CSV ROW FOR FOLD ==========================
         row = {
             "order": a, "window_length": b, "overlap": c,
             "kernel": d, "gamma": e, "C": f,
-            "fold": params["fold"], "fold_mask": g,
+            "fold": r["fold"], "fold_mask": g,
             "accuracy": float(f"{acc:.4f}"),
             "accuracy_std": "",
             "train_time": float(f"{r['training_time']:.2f}"),
@@ -1695,57 +1868,108 @@ if feature_type == "ar":
             "true_counts": true_counts,
             "pred_counts": [int(v) for v in pred_counts],
             "precision": [float(f"{v:.4f}") for v in precision],
-            "recall":    [float(f"{v:.4f}") for v in recall],
-            "f1":        [float(f"{v:.4f}") for v in f1],
+            "recall": [float(f"{v:.4f}") for v in recall],
+            "f1": [float(f"{v:.4f}") for v in f1],
             "model_path": model_path,
-            "cm_path": cm_path
+            "cm_path": cm_path,
+            "cm_npy_path": cm_npy_path,
         }
-
-        csv_rows.append(row)
+        rows_by_key[row_key] = {name: row.get(name, "") for name in fieldnames}
 
     ###########################################################################
-    # 2) GROUP BY (order,wl,ov,kernel,gamma,C) AND COMPUTE MEAN CM + METRICS
+    # 2) RECOMPUTE MEAN ROWS USING ALL AVAILABLE FOLDS (CSV + current run)
     ###########################################################################
 
-    groups = defaultdict(list)
-    for params, r in zip(param_combinations, results):
-        key = (
-            params["order"],
-            params["wl"],
-            params["ov"],
-            params["kernel"],
-            params["gamma"],
-            params["C"],
-        )
-        groups[key].append((params, r))
+    expected_masks_by_key = defaultdict(set)
+    for p in all_param_combinations:
+        key = ar_combo_key(p["order"], p["wl"], p["ov"], p["kernel"], p["gamma"], p["C"])
+        expected_masks_by_key[key].add(build_fold_mask(p["fold"]))
 
     print("\nComputing MEAN confusion matrices for each AR+SVM combination...")
 
-    for key, entries in groups.items():
+    for combo_key, expected_masks in expected_masks_by_key.items():
+        order, wl, ov, kernel, gamma, C = combo_key
+        fold_entries = []
+        missing_rows = []
+        missing_cm = []
 
-        order, wl, ov, kernel, gamma, C = key
+        for fold_mask in sorted(expected_masks):
+            row = rows_by_key.get(combo_key + (fold_mask,))
+            if row is None:
+                missing_rows.append(fold_mask)
+                continue
 
-        # Compute mean accuracy and std
-        accuracies = [r["accuracy"] for (_, r) in entries]
-        mean_accuracy = float(np.mean(accuracies))
-        accuracy_std  = float(np.std(accuracies))
+            cm_npy_path = candidate_cm_npy_path(row)
+            if not cm_npy_path or not os.path.exists(cm_npy_path):
+                missing_cm.append(fold_mask)
+                continue
 
-        cms = [r["confusion_matrix"] for (_, r) in entries]
-        y_tests = [r["y_test"] for (_, r) in entries]
-        y_preds = [r["y_pred"] for (_, r) in entries]
+            try:
+                cm = np.asarray(np.load(cm_npy_path), dtype=float)
+            except Exception:
+                missing_cm.append(fold_mask)
+                continue
 
-        mean_cm = sum(cms) / len(cms)
+            if cm.ndim != 2:
+                missing_cm.append(fold_mask)
+                continue
 
-        # ---------- SAVE MEAN CM (ABSOLUTE) ----------
-        fold_mask = "11111"
-        mean_name_abs = f"{order}_{wl}_{ov}_{kernel}_{gamma}_{C}_{fold_mask}_CM.png"
+            try:
+                fold_acc = float(row.get("accuracy", np.nan))
+            except (TypeError, ValueError):
+                fold_acc = np.nan
+
+            fold_entries.append((fold_mask, cm, fold_acc))
+
+        complete = (len(missing_rows) == 0 and len(missing_cm) == 0 and len(fold_entries) > 0)
+        mean_row_key = combo_key + (mean_fold_mask,)
+
+        if not complete:
+            if combo_key in updated_combo_keys:
+                rows_by_key.pop(mean_row_key, None)
+                print(
+                    f"[WARN] Mean row skipped for {combo_key}: "
+                    f"missing_rows={missing_rows}, missing_cm={missing_cm}. "
+                    f"Removed stale mean row if present."
+                )
+            continue
+
+        cm_shapes = {tuple(entry[1].shape) for entry in fold_entries}
+        if len(cm_shapes) != 1:
+            if combo_key in updated_combo_keys:
+                rows_by_key.pop(mean_row_key, None)
+            print(f"[WARN] Mean row skipped for {combo_key}: inconsistent CM shapes {sorted(cm_shapes)}")
+            continue
+
+        cms = [entry[1] for entry in fold_entries]
+        sum_cm = np.sum(cms, axis=0)
+        mean_cm = sum_cm / len(cms)
+
+        acc_values = np.array([entry[2] for entry in fold_entries], dtype=float)
+        acc_values = acc_values[np.isfinite(acc_values)]
+        if len(acc_values) > 0:
+            mean_accuracy = float(np.mean(acc_values))
+            accuracy_std = float(np.std(acc_values))
+            mean_accuracy_out = float(f"{mean_accuracy:.4f}")
+            accuracy_std_out = float(f"{accuracy_std:.4f}")
+        else:
+            mean_accuracy = np.nan
+            mean_accuracy_out = ""
+            accuracy_std_out = ""
+
+        # Save mean confusion matrices (absolute + normalized) and npy
+        mean_name_abs = f"{order}_{wl}_{ov}_{kernel}_{gamma}_{C}_{mean_fold_mask}_CM.png"
         mean_path_abs = os.path.join(img_dir, mean_name_abs)
+        mean_npy_abs = os.path.splitext(mean_path_abs)[0] + ".npy"
+        np.save(mean_npy_abs, mean_cm)
 
         plt.figure(figsize=(6, 5))
         sns.heatmap(mean_cm, annot=True, cmap="Blues", fmt=".1f")
         plt.title(
             f"MEAN CM (ABS) | acc={mean_accuracy:.4f}\n"
             f"order={order}, wl={wl}, ov={ov}, kernel={kernel}, gamma={gamma}, C={C}"
+            if np.isfinite(mean_accuracy)
+            else f"MEAN CM (ABS)\norder={order}, wl={wl}, ov={ov}, kernel={kernel}, gamma={gamma}, C={C}"
         )
         plt.xlabel("Predicted")
         plt.ylabel("True")
@@ -1753,18 +1977,23 @@ if feature_type == "ar":
         plt.savefig(mean_path_abs)
         plt.close()
 
-        # ---------- SAVE MEAN CM (NORMALIZED) ----------
-        mean_name_norm = f"{order}_{wl}_{ov}_{kernel}_{gamma}_{C}_{fold_mask}_CM_mean.png"
+        mean_name_norm = f"{order}_{wl}_{ov}_{kernel}_{gamma}_{C}_{mean_fold_mask}_CM_mean.png"
         mean_path_norm = os.path.join(img_dir, mean_name_norm)
+        row_sums = mean_cm.sum(axis=1, keepdims=True)
+        mean_cm_norm = np.divide(
+            mean_cm,
+            row_sums,
+            out=np.zeros_like(mean_cm, dtype=float),
+            where=row_sums > 0,
+        )
 
         plt.figure(figsize=(6, 5))
-        sns.heatmap(
-            mean_cm / mean_cm.sum(axis=1)[:, None],
-            annot=True, fmt=".2f", cmap="Blues"
-        )
+        sns.heatmap(mean_cm_norm, annot=True, fmt=".2f", cmap="Blues")
         plt.title(
             f"MEAN CM (Normalized) | acc={mean_accuracy:.4f}\n"
             f"order={order}, wl={wl}, ov={ov}, kernel={kernel}, gamma={gamma}, C={C}"
+            if np.isfinite(mean_accuracy)
+            else f"MEAN CM (Normalized)\norder={order}, wl={wl}, ov={ov}, kernel={kernel}, gamma={gamma}, C={C}"
         )
         plt.xlabel("Predicted")
         plt.ylabel("True")
@@ -1772,75 +2001,58 @@ if feature_type == "ar":
         plt.savefig(mean_path_norm)
         plt.close()
 
-        #print("Saved:", mean_path_abs, "and", mean_path_norm)
+        precision, recall, f1, true_counts, pred_counts = metrics_from_confusion_matrix(sum_cm)
 
-        # ---------- Derive per-class metrics for MEAN ----------
-        y_test_all = np.concatenate(y_tests)
-        y_pred_all = np.concatenate(y_preds)
-
-        precision, recall, f1, support = precision_recall_fscore_support(
-            y_test_all, y_pred_all, labels=np.unique(y_test_all), zero_division=0
-        )
-
-        pred_counts = [np.sum(y_pred_all == lbl) for lbl in np.unique(y_test_all)]
-        true_counts = support.tolist()
-
-        # ---------- CSV entry for mean row ----------
-        csv_rows.append({
+        mean_row = {
             "order": order, "window_length": wl, "overlap": ov,
             "kernel": kernel, "gamma": gamma, "C": C,
-            "fold": "mean", "fold_mask": "11111",
-            "accuracy": float(f"{mean_accuracy:.4f}"),
-            "accuracy_std": float(f"{accuracy_std:.4f}"),
+            "fold": "mean", "fold_mask": mean_fold_mask,
+            "accuracy": mean_accuracy_out,
+            "accuracy_std": accuracy_std_out,
             "train_time": "",
             "gamma_eff": "",
             "num_support_vectors": "",
             "support_vectors_per_class": "",
             "true_counts": true_counts,
-            "pred_counts": [int(v) for v in pred_counts],
+            "pred_counts": pred_counts,
             "precision": [float(f"{v:.4f}") for v in precision],
-            "recall":    [float(f"{v:.4f}") for v in recall],
-            "f1":        [float(f"{v:.4f}") for v in f1],
+            "recall": [float(f"{v:.4f}") for v in recall],
+            "f1": [float(f"{v:.4f}") for v in f1],
             "model_path": "",
             "cm_path": mean_path_abs,
-        })
+            "cm_npy_path": mean_npy_abs,
+        }
+        rows_by_key[mean_row_key] = {name: mean_row.get(name, "") for name in fieldnames}
 
     ###########################################################################
-    # 3) WRITE CSV FILE
+    # 3) REWRITE CSV (DEDUPED)
     ###########################################################################
 
-    # Assign a unique CSV name if needed
-    csv_file_path = os.path.join(csv_dir, "AR_SVM.csv")
+    def sort_key(item):
+        row_key, _ = item
+        order, wl, ov, kernel, gamma, C, fold_mask = row_key
+        is_mean = 1 if fold_mask == mean_fold_mask else 0
+        if fold_mask == mean_fold_mask:
+            fold_ord = AR_EXPECTED_FOLDS
+        else:
+            try:
+                fold_ord = str(fold_mask).index("1")
+            except ValueError:
+                fold_ord = AR_EXPECTED_FOLDS + 1
+        # Keep all fold rows first; append all mean rows at the very end of the CSV.
+        return (is_mean, order, wl, ov, kernel, gamma, C, fold_ord, str(fold_mask))
 
-    # Fieldnames for CSV
-    fieldnames = [
-        "order", "window_length", "overlap",
-        "kernel", "gamma", "C",
-        "fold", "fold_mask",
-        "accuracy", "accuracy_std",
-        "train_time",
-        "gamma_eff",
-        "num_support_vectors",
-        "support_vectors_per_class",
-        "true_counts",
-        "pred_counts",
-        "precision",
-        "recall",
-        "f1",
-        "model_path",
-        "cm_path"
+    ordered_rows = [
+        {name: row.get(name, "") for name in fieldnames}
+        for _, row in sorted(rows_by_key.items(), key=sort_key)
     ]
 
-    file_exists = os.path.exists(csv_file_path)
-
-    with open(csv_file_path, "a", newline="") as csv_file:
+    with open(csv_file_path, "w", newline="") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(ordered_rows)
 
-        if not file_exists:
-            writer.writeheader()
-
-        writer.writerows(csv_rows)
-
-
-    print("\nSaved CSV summary:", csv_file_path)
+    print(f"\nSaved CSV summary ({len(ordered_rows)} rows): {csv_file_path}")
     print("\n==================== END AR FINAL EVALUATION ====================\n")
+
+
