@@ -82,7 +82,9 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 # Define parameters for the data folders
 finger = "thumb"
 test_n = 1
-test = "pressure"
+test = "sliding"
+level = 2
+sliding_ids = [0, 1, 2, 3, 5]
 folder1 = f"{test}_{finger}_{test_n}"
 folder2 = f"{test}_{finger}_{test_n+1}"
 classifier = "svm" # Choose between "svm" or "hmm"
@@ -170,12 +172,21 @@ def ar_combo_key(order, wl, ov, kernel, gamma, C):
     return (int(float(order)), int(float(wl)), int(float(ov)), str(kernel), str(gamma), str(C))
 
 
+def get_ar_output_base_dir():
+    """Return the records_final folder used for AR outputs for the selected test."""
+    if test == "pressure":
+        return os.path.join(script_dir, "data", "records_final", f"{finger}_{test}")
+    if test == "sliding":
+        return os.path.join(script_dir, "data", "records_final", f"{finger}_level_{level}")
+    raise ValueError("Invalid test type. Choose 'pressure' or 'sliding'.")
+
+
 def checkpoint_ar_fold_result(result):
     """
     Persist one AR+SVM fold result immediately (CM image + CM npy + CSV row).
     This protects completed folds from being lost if the process crashes later.
     """
-    base_dir = os.path.join(script_dir, "data", "records_final", f"{finger}_{test}")
+    base_dir = get_ar_output_base_dir()
     img_dir = os.path.join(base_dir, "img_CM")
     model_dir = os.path.join(base_dir, "SVM_model")
     csv_dir = os.path.join(base_dir, "csv_results")
@@ -582,9 +593,70 @@ if feature_type == "ar":
                 # plt.grid()
                 # plt.show()
     elif test == "sliding":
-        AR_coeffs_full  = np.load(os.path.join(script_dir, "data", "records_final", f'{finger}_level_3', "arCoeffs.npy"))
-        noiseVar_full   = np.load(os.path.join(script_dir, "data", "records_final", f'{finger}_level_3', "noiseVariances.npy"))
-        labels_full     = np.load(os.path.join(script_dir, "data", "records_final", f'{finger}_level_3', "labels_concatenated.npy"))
+        dataset_paths = [
+            os.path.join(
+                script_dir,
+                "data",
+                "records_final",
+                f"{finger}_level_{level}",
+                "sliding",
+                f"sliding_{i}"
+            )
+            for i in sliding_ids
+        ]
+
+        AR_data = {}
+
+        for order in AR_orders:
+            AR_data[order] = {}
+            for wl in AR_window_lengths:
+                AR_data[order][wl] = {}
+                for ov in AR_overlaps:
+
+                    print(f"\n=== Loading AR sliding sets for order={order}, wl={wl}, overlap={ov} ===")
+                    AR_data[order][wl][ov] = []
+
+                    # Convert overlap percent --> actual overlap fraction
+                    overlap_fraction = ov / 100.0
+
+                    for d, ds_path in enumerate(dataset_paths):
+                        sliding_id = sliding_ids[d]
+
+                        try:
+                            # Load AR features and RAW labels (labels_full)
+                            AR_features, labels_full = load_ar_set(ds_path, order, wl, ov)
+
+                            N_windows = AR_features.shape[0]
+
+                            # === 1. Ricostruisci le finestre label per questa combinazione
+                            valid_idx, window_labels = window_labels_for_ar(
+                                labels_full,
+                                window_length=wl,
+                                overlap=overlap_fraction
+                            )
+
+                            if len(window_labels) != N_windows:
+                                raise ValueError(
+                                    f"Mismatch windows AR vs label windows: {N_windows} vs {len(window_labels)}"
+                                )
+
+                            # === 2. Filtra AR features e labels per finestre pure
+                            AR_features_valid = AR_features[valid_idx]
+                            labels_valid      = window_labels[valid_idx]
+
+                            # Append this dataset for CV
+                            AR_data[order][wl][ov].append({
+                                "features": AR_features_valid,
+                                "labels": labels_valid
+                            })
+                            if (len(AR_features_valid) != len(labels_valid)):
+                                raise ValueError(
+                                    f"ERROR Mismatch after filtering: {len(AR_features_valid)} features vs {len(labels_valid)} labels"
+                                )
+                            print(f"Loaded AR set OK: dataset sliding_{sliding_id}, valid windows = {len(valid_idx)}")
+
+                        except FileNotFoundError:
+                            print(f"Missing AR set: {order}_{wl}_{ov} in sliding_{sliding_id}")
     else:
         raise ValueError("Invalid test type. Choose 'pressure' or 'sliding'.")
         
@@ -682,7 +754,7 @@ if feature_type == "ar":
     if resume:
         print("\n[RESUME MODE] Checking existing CSV to skip completed runs...")
 
-        csv_dir = os.path.join(script_dir, "data", "records_final", f"{finger}_{test}", "csv_results")
+        csv_dir = os.path.join(get_ar_output_base_dir(), "csv_results")
         csv_path = os.path.join(csv_dir, AR_SVM_CSV_FILENAME)
 
         done_keys = set()
@@ -1756,7 +1828,7 @@ if feature_type == "ar":
     print("\n==================== AR FINAL EVALUATION ====================\n")
 
     # Output dirs
-    base_dir = os.path.join(script_dir, "data", "records_final", f"{finger}_{test}")
+    base_dir = get_ar_output_base_dir()
     img_dir = os.path.join(base_dir, "img_CM")
     model_dir = os.path.join(base_dir, "SVM_model")
     csv_dir = os.path.join(base_dir, "csv_results")

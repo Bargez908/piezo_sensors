@@ -14,7 +14,7 @@ macro_folder = 'records_final';
 
 finger    = 'thumb';
 level     = 2;
-test_n    = 1;
+test_n    = 5;
 test_type = 'sliding';
 
 test = sprintf('%s_level_%d', finger, level);
