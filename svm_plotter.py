@@ -91,7 +91,8 @@ def default_csv_path() -> Path:
         / "records_final"
         / "thumb_pressure"
         / "csv_results"
-        / "AR_SVM.csv"
+        / "new_AR"
+        / "SPECTRAL_AR_SVM.csv"
     )
 
 

@@ -319,6 +319,283 @@ Di seguito i passaggi che esegue `def_fir_classification_multithread.m` quando `
 
 ---
 
+# AR
+
+## Training
+
+### File da lanciare (training AR)
+
+1. `AR_coeff_pressure_new.m`
+2. `def_all_classification_new_resume.py`
+
+Input principali (per ogni dataset `pressure_i`, con `i = 0..4`):
+- `data/records_final/<finger>_<test>/pressure/pressure_<i>/<finger>_downsampled.npy`
+- `data/records_final/<finger>_<test>/pressure/pressure_<i>/labels.npy`
+
+Output principali da `AR_coeff_pressure_new.m`:
+- `data/records_final/<finger>_<test>/pressure/pressure_<i>/ar_coeff/<order>_<wl>_<ov>_arCoeffs.npy`
+- `data/records_final/<finger>_<test>/pressure/pressure_<i>/ar_coeff/<order>_<wl>_<ov>_noiseVariances.npy`
+
+Output principali da `def_all_classification_new_resume.py` (mode AR coeff):
+- `data/records_final/<finger>_<test>/csv_results/AR_SVM.csv`
+- `data/records_final/<finger>_<test>/img_CM/*_CM.png`
+- `data/records_final/<finger>_<test>/img_CM/*_CM.npy`
+
+Output intermedi robusti (checkpoint fold):
+- `*_CM.png`, `*_CM.npy` e riga fold su CSV appena finisce ogni training.
+
+Note operative:
+- Impostare `feature_type = "ar"`.
+- Impostare `AR_FEATURE_MODE = "coeff"` per AR classico (non spettrale).
+- Per riprendere da interruzione: `python def_all_classification_new_resume.py --resume`.
+
+---
+
+## Pipeline file caricati -> output AR
+
+Questa e la pipeline dati tipica per AR classico.
+
+1. **Downsampling e label (upstream)**
+   - Script tipici:
+     - `downsampler_new.py`
+     - `labeler pressure.py`
+   - Salvataggi dataset per ciascun fold/dataset:
+     - `<finger>_downsampled.npy`
+     - `labels.npy`
+
+2. **Estrazione coeff AR**
+   - Script: `AR_coeff_pressure_new.m`
+   - Fa:
+     - windowing per combinazioni `(order, wl, overlap)`
+     - stima Burg (`arburg`) per canale/finestra
+   - Salva:
+     - `<order>_<wl>_<ov>_arCoeffs.npy`
+     - `<order>_<wl>_<ov>_noiseVariances.npy`
+
+3. **Training + valutazione CV AR-SVM**
+   - Script: `def_all_classification_new_resume.py`
+   - Fa:
+     - load AR coeff/noise + `labels.npy`
+     - filtro finestre pure (niente transizioni label)
+     - equalizzazione classi globale tra dataset
+     - 5-fold leave-one-dataset-out
+     - SVM grid search su `(C, gamma, kernel)` per ogni fold
+   - Salva:
+     - checkpoint fold immediato su CSV/CM
+     - aggregazione finale con righe `mean` (`fold_mask=11111`)
+
+---
+
+## Passi training AR (esaustivo)
+
+Di seguito i passaggi principali eseguiti in AR coeff.
+
+1. **Config base**
+   - `feature_type = "ar"`
+   - `AR_FEATURE_MODE = "coeff"`
+   - griglie:
+     - `AR_orders`
+     - `AR_window_lengths`
+     - `AR_overlaps`
+     - `C_values`, `gamma_values`, `kernels`
+
+2. **Load dataset paths (5 dataset)**
+   - `data/records_final/<finger>_<test>/pressure/pressure_0`
+   - ...
+   - `data/records_final/<finger>_<test>/pressure/pressure_4`
+
+3. **Load features AR per combinazione**
+   - Legge:
+     - `ar_coeff/<order>_<wl>_<ov>_arCoeffs.npy`
+     - `ar_coeff/<order>_<wl>_<ov>_noiseVariances.npy`
+     - `labels.npy`
+   - In mode `coeff` usa coeff AR + varianza noise come feature flattenate.
+
+4. **Ricostruzione labels finestra e filtro finestre pure**
+   - Ricrea le finestre label con stesso `wl/ov`.
+   - Tiene solo finestre a label costante.
+
+5. **Pre-processing labels/features**
+   - Opzionale:
+     - pop classi (`pop_values_toggle`)
+     - remap classi (`remap_labels_toggle`)
+
+6. **Equalizzazione globale**
+   - Se attiva, bilancia i dataset con minimo globale condiviso tra classi/dataset.
+
+7. **Build CV sets**
+   - 5-fold leave-one-dataset-out:
+     - 4 dataset train
+     - 1 dataset test
+
+8. **Costruzione task SVM**
+   - Una task per ogni combinazione:
+     - `(order, wl, ov, fold, C, gamma, kernel)`.
+
+9. **Resume mode**
+   - Se `--resume`, legge `AR_SVM.csv`.
+   - Salta task fold gia presenti nel CSV (`fold != mean`).
+
+10. **Training + test per task**
+    - Ogni task fa:
+      - `fit(X_train, y_train)`
+      - `predict(X_test)`
+      - calcolo `accuracy`, `CM`, `precision/recall/f1`.
+
+11. **Checkpoint immediato per fold**
+    - Appena finisce la task:
+      - salva `*_CM.png` e `*_CM.npy`
+      - appende riga fold nel CSV.
+
+12. **Aggregazione finale**
+    - Ricarica/merge dati CSV + run corrente.
+    - Ricalcola righe `mean` (`11111`) solo se tutti i fold necessari sono presenti.
+    - Riscrive CSV deduplicato.
+
+---
+
+## Test
+
+### File da lanciare (test AR)
+
+1. `def_all_classification_new_resume.py`
+
+Note:
+- In AR non c e uno script test separato come FIR.
+- Il test avviene dentro ogni fold CV (`X_test`, `y_test`) durante il training.
+- L output finale include ranking combinazioni e CM aggregate.
+
+---
+
+## Pipeline test (file caricati -> output)
+
+1. **Task fold-level**
+   - Per ogni task SVM calcola predizioni sul fold di test.
+
+2. **Salvataggio incrementale**
+   - Salva subito CM/CSV per non perdere fold in caso di interruzione.
+
+3. **Resume**
+   - Le run successive saltano i fold gia salvati e processano solo i mancanti.
+
+4. **CM media `11111`**
+   - Costruita da tutte le CM fold disponibili (da `.npy`), senza retrain dei fold gia conclusi.
+
+---
+
+## Passi test AR (esaustivo)
+
+1. Generazione predizioni su `X_test` per ogni fold/task.
+2. Calcolo metriche fold (`accuracy`, `CM`, `precision`, `recall`, `f1`).
+3. Checkpoint fold su disco (`png`, `npy`, CSV).
+4. Verifica chiavi risultato (no mismatch/duplicati task).
+5. Ordinamento per accuracy e top combinazioni.
+6. Merge CSV preesistente + risultati run corrente.
+7. Ricalcolo CM medie e metriche aggregate (`fold_mask = 11111`).
+8. Riscrittura CSV finale deduplicata.
+
+---
+
+# AR SPETTRALE
+
+## Training
+
+### File da lanciare (training AR spettrale)
+
+1. `AR_coeff_pressure_new.m`
+2. `def_all_classification_new_resume.py`
+
+Input principali:
+- Stessi file AR coeff/noise prodotti da `AR_coeff_pressure_new.m`.
+- `labels.npy` per ciascun dataset.
+
+Settaggi chiave:
+- `feature_type = "ar"`
+- `AR_FEATURE_MODE = "spectrum"`
+- Parametri spettro:
+  - `AR_SPEC_BINS`
+  - `AR_SPEC_LOG_DB`
+  - `AR_SPEC_EPS`
+
+Output principali (mode spettrale):
+- `data/records_final/<finger>_<test>/csv_results/SPECTRAL_AR_SVM.csv`
+- `data/records_final/<finger>_<test>/img_CM/*_CM.png`
+- `data/records_final/<finger>_<test>/img_CM/*_CM.npy`
+
+Nota naming:
+- Titolo CM fold: `SPECTRAL AR-SVM ...`
+- CSV di resume/evaluation: `SPECTRAL_AR_SVM.csv`
+
+---
+
+## Pipeline file caricati -> output AR SPETTRALE
+
+1. **Load AR coeff/noise**
+   - Legge gli stessi `.npy` AR (coeff + noise) generati a monte.
+
+2. **Trasformazione in feature spettrali**
+   - Costruisce `A(e^jw)` dai coeff AR.
+   - Calcola PSD `sigma^2 / |A(e^jw)|^2`.
+   - Opzionale scala in dB.
+   - Flatten finale: `[windows, channels * bins]`.
+
+3. **CV SVM + checkpoint + final evaluation**
+   - Identico alla pipeline AR classica:
+     - filtro finestre pure
+     - equalizzazione
+     - CV 5-fold
+     - checkpoint incrementale
+     - media `11111` e CSV deduplicato.
+
+---
+
+## Passi training AR SPETTRALE (esaustivo)
+
+1. Config mode spettrale (`AR_FEATURE_MODE = "spectrum"`).
+2. Load `arCoeffs`, `noiseVariances`, `labels`.
+3. Calcolo PSD per finestra/canale su `AR_SPEC_BINS`.
+4. Flatten feature spettrali per SVM.
+5. Filtro finestre pure da labels.
+6. Equalizzazione globale classi/dataset.
+7. 5-fold CV leave-one-dataset-out.
+8. Grid SVM (`C`, `gamma`, `kernel`) per combinazione AR.
+9. Checkpoint fold-by-fold su `SPECTRAL_AR_SVM.csv`.
+10. Aggregazione `mean` (`11111`) e riscrittura CSV finale.
+
+---
+
+## Test
+
+### File da lanciare (test AR spettrale)
+
+1. `def_all_classification_new_resume.py`
+
+Note:
+- Anche qui il test e integrato nel ciclo CV, non separato.
+- `--resume` usa `SPECTRAL_AR_SVM.csv`.
+
+---
+
+## Pipeline test (file caricati -> output)
+
+1. Predizione fold-level per ogni task spettrale.
+2. Salvataggio incrementale CM/CSV su file spettrale.
+3. Ripresa robusta con `--resume`.
+4. Ricostruzione CM media `11111` da CM fold salvate.
+
+---
+
+## Passi test AR SPETTRALE (esaustivo)
+
+1. Predict su fold test con feature spettrali.
+2. Metriche fold + CM.
+3. Checkpoint immediato su CSV/immagini.
+4. Merge risultati storici + correnti.
+5. Ricalcolo `mean` (`11111`) e metriche aggregate.
+6. Salvataggio CSV deduplicato finale.
+
+---
+
 ## Link dati
 
 https://liveunibo-my.sharepoint.com/:f:/g/personal/davide_bargellini2_unibo_it/Et1w4u5-hZ5MmiJ7NF8gM9QBGvveZhVsIYJxcQovzrqT6Q?e=B4O5ct

@@ -6,9 +6,9 @@ import os
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
 finger="thumb"
-test_n = 4
+test_n = 5
 folder=f"sliding_{finger}_{test_n}"
-test = f"{finger}_level_3\\sliding"
+test = f"{finger}_level_2\\sliding"
 
 macro_folder = "records_final"
 test_type = "sliding"  # "sliding" or "pressure"
