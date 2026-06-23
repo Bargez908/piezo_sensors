@@ -72,7 +72,7 @@ treshold = False  # Apply a treshold to the piezo values
 filter_type = "nothing"  # Choose between "highpass" or "lowpass" or "ema" or "nothing"
 freq = 20  # Frequency for the highpass or lowpass filter
 equalize_labels_toggle = True  # Equalize the number of samples for each class
-remap_labels_toggle = False  # Remap labels into fewer classes, look at the remapping function to change the mapping
+remap_labels_toggle = True  # Remap labels into fewer classes, look at the remapping function to change the mapping
 pop_values_toggle = False  # Pop values of the chosen labels
 labels_to_pop = [1,2,3,4]  # Labels to pop from the dataset
 
@@ -368,17 +368,19 @@ def pop_values(labels, features, labels_to_pop):
 
 def remap_labels(y):
     """
-    Rimappa le label secondo la logica desiderata.
-    Attuale (come nel tuo codice):
-      0 -> 0
-      5,6 -> 1
-      1,2,3,4 restano come sono (1..4)
+    Rimappa le label in classificazione binaria:
+      0    -> 0  stop
+      1    -> 1  right
+      2    -> 1  left
+      3    -> 1  up
+      4    -> 1  down
+      5    -> 1  clockwise
+      6    -> 1  counterclockwise
     """
     y_new = np.copy(y)
 
     y_new[np.isin(y, [0])] = 0
-    y_new[np.isin(y, [5, 6])] = 1
-    # se vuoi davvero 3 classi (0, 1-4, 5-6) metti 2 qui sopra
+    y_new[np.isin(y, [1, 2, 3, 4, 5, 6])] = 1
 
     return y_new
 
